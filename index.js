@@ -75,6 +75,8 @@ const validation = {
 
 // Set para no repetir números
 const alreadyChecked = new Set();
+// Cache de nombres de contactos
+const contactNames = new Map();
 
 // ================================================================
 //  TELEGRAM BOT
@@ -125,6 +127,22 @@ async function connectWhatsApp(chatId) {
 
     // Guardar credenciales cuando se actualicen
     sock.ev.on("creds.update", saveCreds);
+
+    // Capturar nombres de contactos (push names)
+    sock.ev.on("contacts.upsert", (contacts) => {
+        for (const c of contacts) {
+            const num = c.id?.split("@")[0];
+            const name = c.notify || c.verifiedName || c.name;
+            if (num && name) contactNames.set(num, name);
+        }
+    });
+    sock.ev.on("contacts.update", (updates) => {
+        for (const c of updates) {
+            const num = c.id?.split("@")[0];
+            const name = c.notify || c.verifiedName || c.name;
+            if (num && name) contactNames.set(num, name);
+        }
+    });
 
     // Manejar actualizaciones de conexión
     sock.ev.on("connection.update", async (update) => {
@@ -238,6 +256,11 @@ async function checkNumbers(numbers) {
         // Baileys onWhatsApp acepta múltiples JIDs a la vez
         const jids = numbers.map((n) => n + "@s.whatsapp.net");
         const results = await sock.onWhatsApp(...jids);
+        
+        // Debug: loguear primeros resultados para diagnóstico
+        if (validation.scanned < 40) {
+            console.log(`[DEBUG] Enviados: ${numbers.slice(0, 3).join(", ")} | Resultados: ${JSON.stringify(results.slice(0, 3))}`);
+        }
 
         // Crear mapa de resultados
         const resultMap = {};
@@ -269,6 +292,36 @@ async function checkNumbers(numbers) {
 //  UTILIDADES
 // ================================================================
 
+async function getWhatsAppName(number) {
+    const jid = number + "@s.whatsapp.net";
+    try {
+        // 1. Buscar en caché de contactos (push name)
+        if (contactNames.has(number)) {
+            return contactNames.get(number);
+        }
+        // 2. Intentar perfil de negocio (business accounts)
+        if (sock && isConnected) {
+            try {
+                const biz = await sock.getBusinessProfile(jid);
+                if (biz?.profile?.description || biz?.profile?.wid) {
+                    // Es cuenta business
+                    const name = biz?.profile?.tag || biz?.profile?.description || null;
+                    if (name && name.length > 0 && name.length < 80) return name;
+                }
+            } catch (_) {
+                // No es business o no disponible — no es error
+            }
+        }
+        // 3. Buscar en store de contactos del socket
+        if (sock?.store?.contacts?.[jid]) {
+            const c = sock.store.contacts[jid];
+            const name = c.notify || c.verifiedName || c.name || c.pushName;
+            if (name) return name;
+        }
+    } catch (_) {}
+    return null; // No se pudo obtener nombre
+}
+
 function generateDigiNumber() {
     const prefix = PREFIJOS_DIGI[Math.floor(Math.random() * PREFIJOS_DIGI.length)];
     const suffix = String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
@@ -290,9 +343,11 @@ function loadAlreadyValidated() {
     } catch (_) {}
 }
 
-function saveNumber(number) {
+function saveNumber(number, name = "Sin nombre") {
+    // Escapar comillas en el nombre
+    const safeName = name.replace(/"/g, '""');
     const exists = fs.existsSync(ARCHIVO_RESULTADOS);
-    const line = exists ? `\n"Sin nombre","${number}"` : `"Nombre","Telefono"\n"Sin nombre","${number}"`;
+    const line = exists ? `\n"${safeName}","${number}"` : `"Nombre","Telefono"\n"${safeName}","${number}"`;
     fs.appendFileSync(ARCHIVO_RESULTADOS, line, "utf-8");
 }
 
@@ -409,8 +464,13 @@ async function validationLoop() {
 
                 if (result === true) {
                     validation.valid++;
-                    saveNumber(number);
-                    console.log(`[VAL] ✅ #${validation.valid}: +${number}`);
+                    // Intentar obtener nombre real
+                    let name = null;
+                    try {
+                        name = await getWhatsAppName(number);
+                    } catch (_) {}
+                    saveNumber(number, name || "Sin nombre");
+                    console.log(`[VAL] ✅ #${validation.valid}: +${number} (${name || "Sin nombre"})`);
                 }
             }
 
