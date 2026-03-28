@@ -271,7 +271,7 @@ async function checkNumbers(numbers) {
 
 function generateDigiNumber() {
     const prefix = PREFIJOS_DIGI[Math.floor(Math.random() * PREFIJOS_DIGI.length)];
-    const suffix = String(Math.floor(Math.random() * 10000000)).padStart(7, "0");
+    const suffix = String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
     return prefix + suffix;
 }
 
