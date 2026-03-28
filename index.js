@@ -281,7 +281,8 @@ async function connectWhatsApp(chatId) {
 async function checkNumbers(numbers) {
     try {
         const jids = numbers.map((n) => `${n}@s.whatsapp.net`);
-        const results = await sock.onWhatsApp(...jids);
+        const results = await withTimeout(sock.onWhatsApp(...jids), 20000, null);
+        if (!results) throw new Error("Timeout en onWhatsApp");
 
         return numbers.map((num) => {
             const found = results.find((r) => r.jid.startsWith(num));
@@ -307,7 +308,7 @@ async function getWhatsAppName(number) {
 
     // 2. Business profile
     try {
-        const biz = await sock.getBusinessProfile(jid);
+        const biz = await withTimeout(sock.getBusinessProfile(jid), 5000, null);
         if (biz?.profile?.tag) return biz.profile.tag;
         if (biz?.description) return biz.description.split("\n")[0].slice(0, 40);
     } catch (_) {}
@@ -368,6 +369,13 @@ function formatTime(ms) {
 
 function sleep(ms) {
     return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function withTimeout(promise, ms, fallback = null) {
+    return Promise.race([
+        promise,
+        new Promise((resolve) => setTimeout(() => resolve(fallback), ms))
+    ]);
 }
 
 // ================================================================
@@ -460,7 +468,7 @@ async function validationLoop() {
                 if (result === true) {
                     // Obtener nombre
                     let name = null;
-                    try { name = await getWhatsAppName(number); } catch (_) {}
+                    try { name = await withTimeout(getWhatsAppName(number), 8000, null); } catch (_) {}
 
                     if (mode === "dedicados") {
                         if (name && name !== "Sin nombre") {
