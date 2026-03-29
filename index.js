@@ -1,13 +1,13 @@
 #!/usr/bin/env node
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║     BOT VALIDADOR DIGI v9.1 — Baileys + Botones + Filtro       ║
+// ║     BOT VALIDADOR DIGI v9.2 — Baileys + Botones + Filtro       ║
 // ╠══════════════════════════════════════════════════════════════════╣
 // ║  🆓 Sin GreenAPI • Sin límites • Sin pagos                       ║
 // ║  📱 Baileys (WhatsApp Web directo)                               ║
 // ║  🎛️ Menú con botones inline en Telegram                          ║
 // ║  👤 Modo Leads Dedicados: solo con nombre real                   ║
 // ║  🎯 Filtro: Solo DIGI o Todos los prefijos                       ║
-// ║  🛡️ Sin bucles de QR • Sin reconexiones infinitas                ║
+// ║  🛡️ 1 solo QR • Live message • Botón cancelar                    ║
 // ║  ⚡ Arranque rápido — /start responde al instante                ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
@@ -42,7 +42,7 @@ const AUTH_DIR = "./auth_session";
 const MAX_ERRORES_SEGUIDOS = 15;
 
 // ── LÍMITES ANTI-BUCLE ──
-const MAX_QR_INTENTOS = 3;
+const QR_TIMEOUT_MS = 60000;          // 60s para escanear el QR
 const MAX_RECONNECT_INTENTOS = 5;
 const RECONNECT_DELAY_MS = 5000;
 const RECONNECT_BACKOFF_MULT = 1.5;
@@ -78,6 +78,11 @@ let qrCount = 0;
 let reconnectCount = 0;
 let reconnectTimer = null;
 let connectionChatId = null;
+
+// ── Estado del QR live message ──
+let qrMessageId = null;       // ID del mensaje de foto QR en Telegram
+let qrStartTime = null;       // Timestamp de cuando se mostró el primer QR
+let connectingMessageId = null; // ID del mensaje "Conectando..." para borrarlo
 
 const validation = {
     active: false,
@@ -117,9 +122,10 @@ bot.on("error", (err) => {
 });
 
 function send(chatId, text, extra = {}) {
-    if (!chatId) return;
+    if (!chatId) return Promise.resolve(null);
     return bot.sendMessage(chatId, text, { parse_mode: "Markdown", ...extra }).catch((e) => {
         console.error("[TG] Error enviando:", e.message);
+        return null;
     });
 }
 
@@ -140,6 +146,14 @@ function mainMenuKeyboard() {
                 [{ text: "🔌 Desconectar", callback_data: "cmd_desconectar" }],
             ],
         },
+    };
+}
+
+function qrCancelKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: "❌ Cancelar", callback_data: "cmd_cancelar_qr" }],
+        ],
     };
 }
 
@@ -279,6 +293,24 @@ function withTimeout(promise, ms, fallback = null) {
 }
 
 // ================================================================
+//  HELPER: Editar caption del mensaje QR (live message)
+// ================================================================
+
+function editQrCaption(chatId, messageId, text, replyMarkup) {
+    if (!chatId || !messageId) return Promise.resolve();
+    return bot.editMessageCaption(text, {
+        chat_id: chatId,
+        message_id: messageId,
+        parse_mode: "Markdown",
+        reply_markup: replyMarkup || undefined,
+    }).catch((e) => {
+        // Si falla editMessageCaption (ej: mensaje ya borrado), enviar nuevo mensaje
+        console.error("[TG] Error editando caption:", e.message);
+        return send(chatId, text, replyMarkup ? { reply_markup: replyMarkup } : mainMenuKeyboard());
+    });
+}
+
+// ================================================================
 //  WHATSAPP — LIMPIEZA DE SOCKET
 // ================================================================
 
@@ -287,6 +319,12 @@ function destroySocket() {
     qrTimeout = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = null;
+
+    // Limpiar estado QR
+    qrMessageId = null;
+    qrStartTime = null;
+    connectingMessageId = null;
+    qrCount = 0;
 
     if (sock) {
         try {
@@ -300,7 +338,7 @@ function destroySocket() {
 }
 
 // ================================================================
-//  WHATSAPP — CONEXIÓN (SIN BUCLES, CON TIMEOUTS)
+//  WHATSAPP — CONEXIÓN (1 SOLO QR, LIVE MESSAGE, 60s TIMEOUT)
 // ================================================================
 
 async function connectWhatsApp(chatId) {
@@ -319,7 +357,6 @@ async function connectWhatsApp(chatId) {
     destroySocket();
 
     isConnecting = true;
-    qrCount = 0;
     connectionChatId = chatId;
 
     console.log("[WA] Iniciando conexión...");
@@ -330,18 +367,24 @@ async function connectWhatsApp(chatId) {
     } catch (e) {
         console.error("[WA] Error cargando estado de auth:", e.message);
         isConnecting = false;
-        if (chatId) send(chatId, "❌ Error cargando sesión. Intenta de nuevo.", mainMenuKeyboard());
+        if (chatId) {
+            // Borrar mensaje "Conectando..." si existe
+            if (connectingMessageId) {
+                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+                connectingMessageId = null;
+            }
+            send(chatId, "❌ Error cargando sesión. Intenta de nuevo.", mainMenuKeyboard());
+        }
         return;
     }
 
-    // ⚡ Obtener versión con timeout de 10s (antes podía colgar 30s+)
+    // ⚡ Obtener versión con timeout de 10s
     let version;
     try {
         const versionResult = await withTimeout(fetchLatestBaileysVersion(), 10000, null);
         if (versionResult) {
             version = versionResult.version;
         } else {
-            // Si falla el fetch, usar versión por defecto
             console.log("[WA] Timeout obteniendo versión, usando default...");
             version = [2, 3000, 1015901307];
         }
@@ -362,8 +405,8 @@ async function connectWhatsApp(chatId) {
             logger,
             printQRInTerminal: false,
             browser: ["DIGI Validator", "Chrome", "1.0"],
-            connectTimeoutMs: 30000,      // ⚡ Reducido de 60s a 30s
-            defaultQueryTimeoutMs: 20000,  // ⚡ Reducido de 30s a 20s
+            connectTimeoutMs: 30000,
+            defaultQueryTimeoutMs: 20000,
             keepAliveIntervalMs: 15000,
             emitOwnEvents: false,
             generateHighQualityLinkPreview: false,
@@ -371,7 +414,13 @@ async function connectWhatsApp(chatId) {
     } catch (e) {
         console.error("[WA] Error creando socket:", e.message);
         isConnecting = false;
-        if (chatId) send(chatId, "❌ Error creando conexión. Intenta de nuevo.", mainMenuKeyboard());
+        if (chatId) {
+            if (connectingMessageId) {
+                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+                connectingMessageId = null;
+            }
+            send(chatId, "❌ Error creando conexión. Intenta de nuevo.", mainMenuKeyboard());
+        }
         return;
     }
 
@@ -394,78 +443,125 @@ async function connectWhatsApp(chatId) {
     sock.ev.on("connection.update", (update) => {
         const { connection, lastDisconnect, qr } = update;
 
-        // ── QR recibido ──
+        // ══════════════════════════════════════════
+        //  QR RECIBIDO — SOLO 1 QR, LIVE MESSAGE
+        // ══════════════════════════════════════════
         if (qr) {
             qrCount++;
-            console.log(`[WA] QR #${qrCount}/${MAX_QR_INTENTOS}`);
+            console.log(`[WA] QR #${qrCount} recibido`);
 
-            // 🛡️ ANTI-BUCLE: Si superamos el máximo de QR, parar
-            if (qrCount > MAX_QR_INTENTOS) {
-                console.log("[WA] Máximo de QR alcanzado. Parando conexión.");
-                destroySocket();
-                if (chatId) {
-                    send(chatId,
-                        `⏰ *Se generaron ${MAX_QR_INTENTOS} QR sin escanear.*\n\n` +
-                        `La conexión se ha detenido para evitar bucles.\n` +
-                        `Pulsa 📱 *Conectar WhatsApp* cuando estés listo para escanear.`,
-                        mainMenuKeyboard()
-                    );
-                }
+            // 🛡️ Solo mostramos el PRIMER QR al usuario
+            // Los siguientes (refresh de Baileys) se ignoran
+            if (qrCount > 1) {
+                console.log(`[WA] QR #${qrCount} ignorado (solo mostramos 1)`);
                 return;
             }
 
+            qrStartTime = Date.now();
+
+            // ── Timeout global de 60 segundos ──
             clearTimeout(qrTimeout);
-
-            // Enviar QR al chat
-            QRCode.toBuffer(qr, { scale: 8 })
-                .then((buffer) => {
-                    if (!chatId) return;
-                    bot.sendPhoto(chatId, buffer, {
-                        caption:
-                            `📱 *Escanea este QR* (${qrCount}/${MAX_QR_INTENTOS})\n\n` +
-                            `1. Abre WhatsApp → ⋮ → Dispositivos vinculados\n` +
-                            `2. Vincular dispositivo\n` +
-                            `3. Escanea este QR\n\n` +
-                            `_Tienes 60s antes de que expire_`,
-                        parse_mode: "Markdown",
-                    }).catch(() => {});
-                })
-                .catch(() => {});
-
-            // Timeout del QR
             qrTimeout = setTimeout(() => {
-                if (!isConnected && qrCount >= MAX_QR_INTENTOS) {
+                if (!isConnected && qrStartTime) {
+                    console.log("[WA] ⏰ Timeout de QR (60s). Cerrando conexión.");
+                    const savedChatId = chatId;
+                    const savedMsgId = qrMessageId;
                     destroySocket();
-                    if (chatId) {
-                        send(chatId,
-                            "⏰ *Tiempo agotado.*\nPulsa 📱 *Conectar* para generar un QR nuevo.",
+
+                    if (savedChatId && savedMsgId) {
+                        editQrCaption(
+                            savedChatId,
+                            savedMsgId,
+                            "⏰ *Tiempo agotado (60s)*\n\n" +
+                            "❌ No se escaneó el QR a tiempo.\n\n" +
+                            "Pulsa 📱 *Conectar* cuando estés listo.",
+                            mainMenuKeyboard().reply_markup
+                        );
+                    } else if (savedChatId) {
+                        send(savedChatId,
+                            "⏰ *Tiempo agotado*\n\nNo se escaneó el QR.\nPulsa 📱 *Conectar* para intentarlo de nuevo.",
                             mainMenuKeyboard()
                         );
                     }
                 }
-            }, 60000);
+            }, QR_TIMEOUT_MS);
+
+            // ── Generar imagen QR y enviar como foto con botón Cancelar ──
+            QRCode.toBuffer(qr, { scale: 8 })
+                .then(async (buffer) => {
+                    if (!chatId) return;
+
+                    // Borrar mensaje "Conectando..." si existe
+                    if (connectingMessageId) {
+                        bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+                        connectingMessageId = null;
+                    }
+
+                    const caption =
+                        `📱 *Escanea este QR*\n\n` +
+                        `⏳ Tienes *60 segundos*...\n\n` +
+                        `1️⃣ Abre WhatsApp → ⋮ → *Dispositivos vinculados*\n` +
+                        `2️⃣ Toca _Vincular dispositivo_\n` +
+                        `3️⃣ Escanea este código QR`;
+
+                    const sentMsg = await bot.sendPhoto(chatId, buffer, {
+                        caption,
+                        parse_mode: "Markdown",
+                        reply_markup: qrCancelKeyboard(),
+                    }).catch((e) => {
+                        console.error("[TG] Error enviando QR:", e.message);
+                        return null;
+                    });
+
+                    if (sentMsg) {
+                        qrMessageId = sentMsg.message_id;
+                        console.log(`[WA] QR enviado como mensaje #${qrMessageId}`);
+                    }
+                })
+                .catch((e) => {
+                    console.error("[QR] Error generando imagen:", e.message);
+                });
         }
 
-        // ── Conexión abierta ──
+        // ══════════════════════════════════════════
+        //  CONEXIÓN ABIERTA → Editar QR a ✅
+        // ══════════════════════════════════════════
         if (connection === "open") {
             isConnected = true;
             isConnecting = false;
-            qrCount = 0;
             reconnectCount = 0;
             clearTimeout(qrTimeout);
             qrTimeout = null;
 
             const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
             console.log(`[WA] ✅ Conectado como +${phone}`);
-            if (chatId) {
-                send(chatId,
-                    `✅ *¡WhatsApp conectado!*\n\n📱 Número: +${phone}\n🟢 Estado: Activo\n\n_Listo para validar_`,
-                    mainMenuKeyboard()
-                );
+
+            const successText =
+                `✅ *¡WhatsApp conectado!*\n\n` +
+                `📱 Número: +${phone}\n` +
+                `🟢 Estado: Activo\n\n` +
+                `_Listo para validar_`;
+
+            if (chatId && qrMessageId) {
+                // ── LIVE MESSAGE: editar el caption de la foto QR ──
+                editQrCaption(chatId, qrMessageId, successText, mainMenuKeyboard().reply_markup);
+                qrMessageId = null;
+            } else if (chatId) {
+                // Si no hay foto QR (ej: reconexión automática), mensaje nuevo
+                // Borrar "Conectando..." si existe
+                if (connectingMessageId) {
+                    bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+                    connectingMessageId = null;
+                }
+                send(chatId, successText, mainMenuKeyboard());
             }
+
+            qrStartTime = null;
         }
 
-        // ── Conexión cerrada ──
+        // ══════════════════════════════════════════
+        //  CONEXIÓN CERRADA
+        // ══════════════════════════════════════════
         if (connection === "close") {
             const wasConnected = isConnected;
             isConnected = false;
@@ -477,17 +573,40 @@ async function connectWhatsApp(chatId) {
             const msg = lastDisconnect?.error?.message || "desconocido";
             console.log(`[WA] Desconectado. Código: ${code} | Motivo: ${msg}`);
 
+            // ── Si teníamos QR visible y NO nos conectamos → editar a error ──
+            const savedQrMsgId = qrMessageId;
+            qrMessageId = null;
+            qrStartTime = null;
+
             // ── Sesión cerrada (loggedOut) → borrar credenciales, NO reconectar ──
             if (code === DisconnectReason.loggedOut) {
                 console.log("[WA] Sesión cerrada por el usuario. Borrando credenciales...");
                 try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
                 sock = null;
-                if (chatId) {
+
+                if (chatId && savedQrMsgId) {
+                    editQrCaption(chatId, savedQrMsgId,
+                        "🔴 *Sesión cerrada*\n\nSe han eliminado las credenciales.\nUsa 📱 *Conectar* para vincular de nuevo.",
+                        mainMenuKeyboard().reply_markup
+                    );
+                } else if (chatId) {
                     send(chatId,
                         "🔴 *Sesión cerrada*\n\nSe han eliminado las credenciales.\nUsa 📱 *Conectar* para vincular de nuevo.",
                         mainMenuKeyboard()
                     );
                 }
+                return;
+            }
+
+            // ── Si había QR mostrándose y la conexión cerró (QR expirado internamente) ──
+            if (savedQrMsgId && !wasConnected && chatId) {
+                editQrCaption(chatId, savedQrMsgId,
+                    "❌ *No se pudo vincular*\n\n" +
+                    "El QR ha expirado o hubo un error.\n\n" +
+                    "Pulsa 📱 *Conectar* para intentarlo de nuevo.",
+                    mainMenuKeyboard().reply_markup
+                );
+                sock = null;
                 return;
             }
 
@@ -885,7 +1004,7 @@ bot.on("callback_query", async (query) => {
     if (data === "menu_main") {
         const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
         send(chatId,
-            `🤖 *Bot Validador DIGI v9.1*\n` +
+            `🤖 *Bot Validador DIGI v9.2*\n` +
             `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
             `📱 WhatsApp: ${status}`,
             mainMenuKeyboard()
@@ -893,7 +1012,29 @@ bot.on("callback_query", async (query) => {
         return;
     }
 
-    // ── CONECTAR ──
+    // ═══════════════════════════════════════
+    //  CANCELAR QR (botón del live message)
+    // ═══════════════════════════════════════
+    if (data === "cmd_cancelar_qr") {
+        console.log("[WA] Usuario canceló el QR");
+        const savedMsgId = qrMessageId;
+        destroySocket();
+
+        if (savedMsgId) {
+            editQrCaption(chatId, savedMsgId,
+                "❌ *Conexión cancelada*\n\n" +
+                "Pulsa 📱 *Conectar* cuando estés listo para escanear.",
+                mainMenuKeyboard().reply_markup
+            );
+        } else {
+            send(chatId, "❌ *Conexión cancelada*", mainMenuKeyboard());
+        }
+        return;
+    }
+
+    // ═══════════════════════════════════════
+    //  CONECTAR — Live message flow
+    // ═══════════════════════════════════════
     if (data === "cmd_conectar") {
         if (isConnected && sock) {
             const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
@@ -908,10 +1049,19 @@ bot.on("callback_query", async (query) => {
             send(chatId, "⏳ *Ya se está conectando...*\nEspera a que aparezca el QR.");
             return;
         }
-        send(chatId, "📱 *Conectando WhatsApp...*\n\nGenerando QR, espera unos segundos...");
+
+        // Enviar mensaje "Conectando..." y guardar su ID para borrarlo cuando llegue el QR
+        const initMsg = await send(chatId, "📱 *Conectando WhatsApp...*\n\n⏳ Generando QR, espera unos segundos...");
+        connectingMessageId = initMsg?.message_id || null;
+
         connectWhatsApp(chatId).catch((e) => {
             console.error("[WA] Error en connectWhatsApp:", e.message);
             isConnecting = false;
+            // Borrar "Conectando..." si existe
+            if (connectingMessageId) {
+                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+                connectingMessageId = null;
+            }
             send(chatId, `❌ Error conectando: \`${e.message}\`\n\nIntenta de nuevo.`, mainMenuKeyboard());
         });
         return;
@@ -1145,7 +1295,7 @@ bot.onText(/\/start/, (msg) => {
     console.log(`[CMD] /start recibido de chat ${msg.chat.id}`);
     const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
     send(msg.chat.id,
-        `🤖 *Bot Validador DIGI v9.1*\n` +
+        `🤖 *Bot Validador DIGI v9.2*\n` +
         `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
         `📱 WhatsApp: ${status}\n\n` +
         `Usa los botones o escribe comandos:`,
@@ -1165,9 +1315,15 @@ bot.onText(/\/conectar/, async (msg) => {
         send(chatId, "⏳ *Ya se está conectando...*\nEspera a que aparezca el QR.");
         return;
     }
-    send(chatId, "📱 *Conectando WhatsApp...*\nGenerando QR...");
+    const initMsg = await send(chatId, "📱 *Conectando WhatsApp...*\n⏳ Generando QR...");
+    connectingMessageId = initMsg?.message_id || null;
+
     connectWhatsApp(chatId).catch((e) => {
         isConnecting = false;
+        if (connectingMessageId) {
+            bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
+            connectingMessageId = null;
+        }
         send(chatId, `❌ Error: \`${e.message}\``, mainMenuKeyboard());
     });
 });
@@ -1290,21 +1446,17 @@ process.on("unhandledRejection", (reason) => {
 
 async function main() {
     console.log("╔══════════════════════════════════════════════════════════╗");
-    console.log("║   BOT VALIDADOR DIGI v9.1 — Fast Start Edition         ║");
+    console.log("║   BOT VALIDADOR DIGI v9.2 — 1 QR Live Message          ║");
     console.log("║   100% Gratis • Sin límites • Sin GreenAPI              ║");
     console.log("╚══════════════════════════════════════════════════════════╝");
     console.log();
     console.log(`  Prefijos DIGI: ${PREFIJOS_DIGI.join(", ")}`);
     console.log(`  Prefijos totales: ${PREFIJOS_TODOS.length}`);
     console.log(`  Batch: ${BATCH_SIZE} | Delay: ${DELAY_ENTRE_LOTES_MS}ms`);
-    console.log(`  Modos: Leads | Dedicados`);
-    console.log(`  Filtros: Solo DIGI | Todos`);
-    console.log(`  Límite QR: ${MAX_QR_INTENTOS} intentos`);
-    console.log(`  Límite reconexiones: ${MAX_RECONNECT_INTENTOS} intentos`);
+    console.log(`  QR timeout: ${QR_TIMEOUT_MS / 1000}s | Reconexiones: ${MAX_RECONNECT_INTENTOS}`);
     console.log();
 
-    // ⚡ CAMBIO CLAVE: El bot de Telegram YA está activo (polling: true arriba)
-    // Así que /start responde INMEDIATAMENTE, sin esperar a WhatsApp
+    // ⚡ Telegram ya está activo (polling: true arriba)
     console.log("[BOT] ✅ Telegram activo — /start ya funciona");
 
     // Intentar reconectar WhatsApp EN BACKGROUND (no bloqueante)
