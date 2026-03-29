@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ╔══════════════════════════════════════════════════════════════════╗
-// ║     BOT VALIDADOR DIGI v9.0 — Baileys + Botones + Filtro       ║
+// ║     BOT VALIDADOR DIGI v9.1 — Baileys + Botones + Filtro       ║
 // ╠══════════════════════════════════════════════════════════════════╣
 // ║  🆓 Sin GreenAPI • Sin límites • Sin pagos                       ║
 // ║  📱 Baileys (WhatsApp Web directo)                               ║
@@ -8,6 +8,7 @@
 // ║  👤 Modo Leads Dedicados: solo con nombre real                   ║
 // ║  🎯 Filtro: Solo DIGI o Todos los prefijos                       ║
 // ║  🛡️ Sin bucles de QR • Sin reconexiones infinitas                ║
+// ║  ⚡ Arranque rápido — /start responde al instante                ║
 // ╚══════════════════════════════════════════════════════════════════╝
 
 "use strict";
@@ -41,11 +42,10 @@ const AUTH_DIR = "./auth_session";
 const MAX_ERRORES_SEGUIDOS = 15;
 
 // ── LÍMITES ANTI-BUCLE ──
-const MAX_QR_INTENTOS = 3;            // Máximo QR sin escanear antes de parar
-const QR_EXPIRY_MS = 60000;           // Tiempo máximo esperando QR (60s)
-const MAX_RECONNECT_INTENTOS = 5;     // Máx reconexiones automáticas seguidas
-const RECONNECT_DELAY_MS = 5000;      // Delay base entre reconexiones
-const RECONNECT_BACKOFF_MULT = 1.5;   // Multiplicador de backoff
+const MAX_QR_INTENTOS = 3;
+const MAX_RECONNECT_INTENTOS = 5;
+const RECONNECT_DELAY_MS = 5000;
+const RECONNECT_BACKOFF_MULT = 1.5;
 
 // ================================================================
 //  IMPORTS
@@ -72,12 +72,12 @@ const logger = pino({ level: "silent" });
 
 let sock = null;
 let isConnected = false;
-let isConnecting = false;          // 🛡️ NUEVO: evita múltiples conexiones simultáneas
+let isConnecting = false;
 let qrTimeout = null;
-let qrCount = 0;                   // 🛡️ NUEVO: contador de QR generados sin escanear
-let reconnectCount = 0;            // 🛡️ NUEVO: contador de reconexiones seguidas
-let reconnectTimer = null;         // 🛡️ NUEVO: timer de reconexión (para poder cancelar)
-let connectionChatId = null;       // 🛡️ NUEVO: chatId asociado a la conexión actual
+let qrCount = 0;
+let reconnectCount = 0;
+let reconnectTimer = null;
+let connectionChatId = null;
 
 const validation = {
     active: false,
@@ -92,27 +92,21 @@ const validation = {
     chatId: null,
     lastNotify: 0,
     lastError: "",
-    mode: "leads",       // "leads" o "dedicados"
-    filter: "digi",      // "digi" o "todos"
+    mode: "leads",
+    filter: "digi",
 };
 
 const alreadyChecked = new Set();
 const contactNames = new Map();
 
 // ================================================================
-//  TELEGRAM BOT (con manejo de errores de polling)
+//  TELEGRAM BOT — polling: true (simple y fiable)
 // ================================================================
 
-const bot = new TelegramBot(TELEGRAM_TOKEN, {
-    polling: {
-        autoStart: true,
-        params: { timeout: 30 },
-    },
-});
+const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
 
-// 🛡️ NUEVO: Manejar errores de polling para que no crashee
+// 🛡️ Manejar errores de polling para que no crashee
 bot.on("polling_error", (err) => {
-    // Solo loguear si no es un timeout normal
     if (err.code !== "ETELEGRAM" || !err.message?.includes("409")) {
         console.error("[TG] Error de polling:", err.code || err.message);
     }
@@ -288,7 +282,6 @@ function withTimeout(promise, ms, fallback = null) {
 //  WHATSAPP — LIMPIEZA DE SOCKET
 // ================================================================
 
-// 🛡️ NUEVO: Función para cerrar y limpiar el socket anterior
 function destroySocket() {
     clearTimeout(qrTimeout);
     qrTimeout = null;
@@ -307,7 +300,7 @@ function destroySocket() {
 }
 
 // ================================================================
-//  WHATSAPP — CONEXIÓN (SIN BUCLES)
+//  WHATSAPP — CONEXIÓN (SIN BUCLES, CON TIMEOUTS)
 // ================================================================
 
 async function connectWhatsApp(chatId) {
@@ -329,6 +322,8 @@ async function connectWhatsApp(chatId) {
     qrCount = 0;
     connectionChatId = chatId;
 
+    console.log("[WA] Iniciando conexión...");
+
     let state, saveCreds;
     try {
         ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR));
@@ -339,15 +334,23 @@ async function connectWhatsApp(chatId) {
         return;
     }
 
+    // ⚡ Obtener versión con timeout de 10s (antes podía colgar 30s+)
     let version;
     try {
-        ({ version } = await fetchLatestBaileysVersion());
+        const versionResult = await withTimeout(fetchLatestBaileysVersion(), 10000, null);
+        if (versionResult) {
+            version = versionResult.version;
+        } else {
+            // Si falla el fetch, usar versión por defecto
+            console.log("[WA] Timeout obteniendo versión, usando default...");
+            version = [2, 3000, 1015901307];
+        }
     } catch (e) {
-        console.error("[WA] Error obteniendo versión de Baileys:", e.message);
-        isConnecting = false;
-        if (chatId) send(chatId, "❌ Error conectando con WhatsApp. Intenta de nuevo.", mainMenuKeyboard());
-        return;
+        console.log("[WA] Error obteniendo versión, usando default:", e.message);
+        version = [2, 3000, 1015901307];
     }
+
+    console.log(`[WA] Versión: ${version.join(".")}`);
 
     try {
         sock = makeWASocket({
@@ -359,8 +362,8 @@ async function connectWhatsApp(chatId) {
             logger,
             printQRInTerminal: false,
             browser: ["DIGI Validator", "Chrome", "1.0"],
-            connectTimeoutMs: 60000,
-            defaultQueryTimeoutMs: 30000,
+            connectTimeoutMs: 30000,      // ⚡ Reducido de 60s a 30s
+            defaultQueryTimeoutMs: 20000,  // ⚡ Reducido de 30s a 20s
             keepAliveIntervalMs: 15000,
             emitOwnEvents: false,
             generateHighQualityLinkPreview: false,
@@ -411,7 +414,6 @@ async function connectWhatsApp(chatId) {
                 return;
             }
 
-            // Limpiar timeout anterior
             clearTimeout(qrTimeout);
 
             // Enviar QR al chat
@@ -430,7 +432,7 @@ async function connectWhatsApp(chatId) {
                 })
                 .catch(() => {});
 
-            // Timeout del QR actual
+            // Timeout del QR
             qrTimeout = setTimeout(() => {
                 if (!isConnected && qrCount >= MAX_QR_INTENTOS) {
                     destroySocket();
@@ -441,7 +443,7 @@ async function connectWhatsApp(chatId) {
                         );
                     }
                 }
-            }, QR_EXPIRY_MS);
+            }, 60000);
         }
 
         // ── Conexión abierta ──
@@ -449,7 +451,7 @@ async function connectWhatsApp(chatId) {
             isConnected = true;
             isConnecting = false;
             qrCount = 0;
-            reconnectCount = 0;     // Reset reconexiones al conectar ok
+            reconnectCount = 0;
             clearTimeout(qrTimeout);
             qrTimeout = null;
 
@@ -489,10 +491,9 @@ async function connectWhatsApp(chatId) {
                 return;
             }
 
-            // ── Otros códigos: intentar reconectar con LÍMITE ──
-            // Solo reconectar si teníamos sesión previa (no si estábamos esperando QR)
+            // ── Solo reconectar si hay sesión guardada ──
             const hasSession = fs.existsSync(AUTH_DIR) &&
-                               fs.readdirSync(AUTH_DIR).length > 0;
+                               (() => { try { return fs.readdirSync(AUTH_DIR).length > 0; } catch(_) { return false; } })();
 
             if (!hasSession) {
                 console.log("[WA] No hay sesión guardada. No reconectar.");
@@ -509,7 +510,7 @@ async function connectWhatsApp(chatId) {
             reconnectCount++;
             console.log(`[WA] Intento de reconexión ${reconnectCount}/${MAX_RECONNECT_INTENTOS}`);
 
-            // 🛡️ ANTI-BUCLE: Si superamos las reconexiones, parar
+            // 🛡️ ANTI-BUCLE: máximo de reconexiones
             if (reconnectCount > MAX_RECONNECT_INTENTOS) {
                 console.log("[WA] Máximo de reconexiones alcanzado. Parando.");
                 destroySocket();
@@ -527,7 +528,7 @@ async function connectWhatsApp(chatId) {
             // Reconectar con backoff exponencial
             const delay = Math.min(
                 RECONNECT_DELAY_MS * Math.pow(RECONNECT_BACKOFF_MULT, reconnectCount - 1),
-                60000 // máximo 60s
+                60000
             );
 
             if (wasConnected && chatId) {
@@ -538,7 +539,7 @@ async function connectWhatsApp(chatId) {
                 );
             }
 
-            // Limpiar socket anterior antes de reconectar
+            // Limpiar socket anterior
             try {
                 sock.ev.removeAllListeners();
             } catch (_) {}
@@ -590,7 +591,7 @@ async function getWhatsAppName(number) {
 
     const jid = `${number}@s.whatsapp.net`;
 
-    // 1. Cache de contactos (push name)
+    // 1. Cache de contactos
     const cached = contactNames.get(jid);
     if (cached) return cached;
 
@@ -601,7 +602,7 @@ async function getWhatsAppName(number) {
         if (biz?.description) return biz.description.split("\n")[0].slice(0, 40);
     } catch (_) {}
 
-    // 3. Store de contactos de Baileys
+    // 3. Store de contactos
     try {
         if (sock.store?.contacts?.[jid]) {
             const c = sock.store.contacts[jid];
@@ -613,7 +614,7 @@ async function getWhatsAppName(number) {
 }
 
 // ================================================================
-//  LOOP DE VALIDACIÓN (MEJORADO)
+//  LOOP DE VALIDACIÓN
 // ================================================================
 
 async function validationLoop() {
@@ -632,8 +633,8 @@ async function validationLoop() {
 
     loadAlreadyValidated();
 
-    let disconnectWaits = 0;         // 🛡️ NUEVO: contador de esperas por desconexión
-    const MAX_DISCONNECT_WAITS = 3;  // Máximo veces que esperamos reconexión
+    let disconnectWaits = 0;
+    const MAX_DISCONNECT_WAITS = 3;
 
     try {
         while (validation.valid < target) {
@@ -642,7 +643,7 @@ async function validationLoop() {
                 break;
             }
 
-            // 🛡️ MEJORADO: Manejar desconexión con límite de esperas
+            // Manejar desconexión con límite
             if (!isConnected) {
                 disconnectWaits++;
 
@@ -662,7 +663,6 @@ async function validationLoop() {
                     `_Timeout: 30s_`
                 );
 
-                // Esperar hasta 30s comprobando cada 3s
                 let waited = 0;
                 while (!isConnected && waited < 30000 && !validation.stopRequested) {
                     await sleep(3000);
@@ -670,20 +670,18 @@ async function validationLoop() {
                 }
 
                 if (!isConnected) {
-                    continue; // Volver al while para incrementar disconnectWaits
+                    continue;
                 }
 
-                // Se reconectó
                 console.log("[VAL] Reconectado, continuando validación...");
                 disconnectWaits = 0;
                 validation.errorsInRow = 0;
                 continue;
             }
 
-            // Reset contador si estamos conectados
             disconnectWaits = 0;
 
-            // 🛡️ MEJORADO: Pausa por muchos errores seguidos con límite
+            // Pausa por muchos errores seguidos
             if (validation.errorsInRow >= MAX_ERRORES_SEGUIDOS) {
                 console.log(`[VAL] ${validation.errorsInRow} errores seguidos. Pausa 30s...`);
                 send(chatId,
@@ -694,7 +692,6 @@ async function validationLoop() {
                 await sleep(30000);
                 validation.errorsInRow = 0;
 
-                // Si se desconectó durante la pausa, volver al loop
                 if (!isConnected) continue;
             }
 
@@ -732,7 +729,6 @@ async function validationLoop() {
                 validation.errorsInRow = 0;
 
                 if (result === true) {
-                    // Obtener nombre
                     let name = null;
                     try {
                         name = await withTimeout(getWhatsAppName(number), 8000, null);
@@ -873,7 +869,7 @@ function startValidation(chatId, target, mode, filter) {
 //  ESTADO PARA CALLBACKS
 // ================================================================
 
-const waitingCustomAmount = new Map(); // 🛡️ Cambiado de Set a Map para timeout
+const waitingCustomAmount = new Map();
 
 // ================================================================
 //  CALLBACK QUERIES (BOTONES)
@@ -883,14 +879,13 @@ bot.on("callback_query", async (query) => {
     const chatId = query.message.chat.id;
     const data = query.data;
 
-    // Responder callback (evitar el relojito en Telegram)
     bot.answerCallbackQuery(query.id).catch(() => {});
 
     // ── MENÚ PRINCIPAL ──
     if (data === "menu_main") {
         const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
         send(chatId,
-            `🤖 *Bot Validador DIGI v9.0*\n` +
+            `🤖 *Bot Validador DIGI v9.1*\n` +
             `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
             `📱 WhatsApp: ${status}`,
             mainMenuKeyboard()
@@ -958,11 +953,9 @@ bot.on("callback_query", async (query) => {
 
     // ── CANTIDAD PERSONALIZADA ──
     if (data === "cant_custom") {
-        // Limpiar timeout anterior si existía
         const prevTimeout = waitingCustomAmount.get(chatId);
         if (prevTimeout) clearTimeout(prevTimeout);
 
-        // Auto-cancelar después de 60s
         const timeout = setTimeout(() => {
             if (waitingCustomAmount.has(chatId)) {
                 waitingCustomAmount.delete(chatId);
@@ -982,7 +975,7 @@ bot.on("callback_query", async (query) => {
     // ── MODO SELECCIONADO → FILTRO ──
     if (data.startsWith("mode_leads_") || data.startsWith("mode_dedicados_")) {
         const parts = data.split("_");
-        const mode = parts[1]; // "leads" o "dedicados"
+        const mode = parts[1];
         const cantidad = parseInt(parts[2]);
         if (isNaN(cantidad) || cantidad < 1) {
             send(chatId, "❌ Error en la cantidad. Vuelve a empezar.", mainMenuKeyboard());
@@ -1000,9 +993,8 @@ bot.on("callback_query", async (query) => {
     // ── FILTRO SELECCIONADO → INICIAR ──
     if (data.startsWith("filter_")) {
         const parts = data.split("_");
-        // filter_digi_leads_2000 o filter_todos_dedicados_4000
-        const filter = parts[1]; // "digi" o "todos"
-        const mode = parts[2];   // "leads" o "dedicados"
+        const filter = parts[1];
+        const mode = parts[2];
         const cantidad = parseInt(parts[3]);
 
         if (!["digi", "todos"].includes(filter) || !["leads", "dedicados"].includes(mode)) {
@@ -1064,7 +1056,7 @@ bot.on("callback_query", async (query) => {
 });
 
 // ================================================================
-//  FUNCIONES COMPARTIDAS (botones + comandos texto)
+//  FUNCIONES COMPARTIDAS
 // ================================================================
 
 function sendEstado(chatId) {
@@ -1146,13 +1138,14 @@ async function sendDescargar(chatId) {
 }
 
 // ================================================================
-//  COMANDOS TEXTO (mantener compatibilidad)
+//  COMANDOS TEXTO (compatibilidad)
 // ================================================================
 
 bot.onText(/\/start/, (msg) => {
+    console.log(`[CMD] /start recibido de chat ${msg.chat.id}`);
     const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
     send(msg.chat.id,
-        `🤖 *Bot Validador DIGI v9.0*\n` +
+        `🤖 *Bot Validador DIGI v9.1*\n` +
         `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
         `📱 WhatsApp: ${status}\n\n` +
         `Usa los botones o escribe comandos:`,
@@ -1162,6 +1155,7 @@ bot.onText(/\/start/, (msg) => {
 
 bot.onText(/\/conectar/, async (msg) => {
     const chatId = msg.chat.id;
+    console.log(`[CMD] /conectar recibido de chat ${chatId}`);
     if (isConnected) {
         const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
         send(chatId, `✅ *Ya estás conectado*\n📱 +${phone}`, mainMenuKeyboard());
@@ -1232,7 +1226,7 @@ bot.onText(/\/desconectar/, async (msg) => {
     send(chatId, "🔴 *Sesión cerrada*\nCredenciales eliminadas.", mainMenuKeyboard());
 });
 
-// ── CAPTURAR MENSAJES DE TEXTO para cantidad personalizada ──
+// ── CAPTURAR MENSAJES para cantidad personalizada ──
 bot.on("message", (msg) => {
     const chatId = msg.chat.id;
     if (!waitingCustomAmount.has(chatId)) return;
@@ -1246,7 +1240,6 @@ bot.on("message", (msg) => {
 
     const cantidad = Math.min(100000, num);
 
-    // Limpiar timeout
     const timeout = waitingCustomAmount.get(chatId);
     if (timeout) clearTimeout(timeout);
     waitingCustomAmount.delete(chatId);
@@ -1258,7 +1251,7 @@ bot.on("message", (msg) => {
 });
 
 // ================================================================
-//  APAGADO LIMPIO (SIGINT / SIGTERM)
+//  APAGADO LIMPIO
 // ================================================================
 
 function gracefulShutdown(signal) {
@@ -1281,25 +1274,23 @@ function gracefulShutdown(signal) {
 process.on("SIGINT", () => gracefulShutdown("SIGINT"));
 process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
 
-// 🛡️ NUEVO: Capturar errores no manejados para que no crashee
+// 🛡️ Capturar errores no manejados
 process.on("uncaughtException", (err) => {
     console.error("[FATAL] Excepción no capturada:", err.message);
     console.error(err.stack);
-    // No salir — intentar seguir funcionando
 });
 
 process.on("unhandledRejection", (reason) => {
     console.error("[FATAL] Promesa rechazada no capturada:", reason);
-    // No salir — intentar seguir funcionando
 });
 
 // ================================================================
-//  MAIN
+//  MAIN — ⚡ Arranque rápido (NO bloquea Telegram)
 // ================================================================
 
 async function main() {
     console.log("╔══════════════════════════════════════════════════════════╗");
-    console.log("║   BOT VALIDADOR DIGI v9.0 — Anti-Bucle Edition         ║");
+    console.log("║   BOT VALIDADOR DIGI v9.1 — Fast Start Edition         ║");
     console.log("║   100% Gratis • Sin límites • Sin GreenAPI              ║");
     console.log("╚══════════════════════════════════════════════════════════╝");
     console.log();
@@ -1312,26 +1303,26 @@ async function main() {
     console.log(`  Límite reconexiones: ${MAX_RECONNECT_INTENTOS} intentos`);
     console.log();
 
-    if (fs.existsSync(AUTH_DIR)) {
-        let files = [];
-        try { files = fs.readdirSync(AUTH_DIR); } catch (_) {}
+    // ⚡ CAMBIO CLAVE: El bot de Telegram YA está activo (polling: true arriba)
+    // Así que /start responde INMEDIATAMENTE, sin esperar a WhatsApp
+    console.log("[BOT] ✅ Telegram activo — /start ya funciona");
 
-        if (files.length > 0) {
-            console.log("[WA] Sesión previa encontrada. Reconectando...");
-            try {
-                await connectWhatsApp(null);
-            } catch (e) {
-                console.error("[WA] Error reconectando:", e.message);
-                isConnecting = false;
-            }
-        } else {
-            console.log("[WA] Carpeta de sesión vacía. Esperando /conectar...");
-        }
+    // Intentar reconectar WhatsApp EN BACKGROUND (no bloqueante)
+    const hasSession = fs.existsSync(AUTH_DIR) &&
+                       (() => { try { return fs.readdirSync(AUTH_DIR).length > 0; } catch(_) { return false; } })();
+
+    if (hasSession) {
+        console.log("[WA] Sesión previa encontrada. Reconectando en background...");
+        // 🔥 NO usamos await — se ejecuta en background
+        connectWhatsApp(null).catch((e) => {
+            console.error("[WA] Error reconectando:", e.message);
+            isConnecting = false;
+        });
     } else {
         console.log("[WA] No hay sesión. Esperando /conectar...");
     }
 
-    console.log("[BOT] ✅ Bot de Telegram activo. Esperando comandos...");
+    console.log("[BOT] ✅ Bot listo. Esperando comandos...");
 }
 
 main().catch((e) => {
