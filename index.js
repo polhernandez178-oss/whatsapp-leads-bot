@@ -100,7 +100,7 @@ function destroy() {
     clearTimeout(qrTimer); qrTimer = null;
     clearTimeout(reconnTimer); reconnTimer = null;
     qrMsgId = null; qrStart = null; connMsgId = null; qrN = 0;
-    if (sock) { try { sock.ev.removeAllListeners(); sock.end(undefined); } catch (_) {} sock = null; }
+    if (sock) { try { sock.ev.removeAllListeners(); sock.end(); } catch (_) { try { sock.ws?.close(); } catch (_) {} } sock = null; }
     connected = false; connecting = false;
 }
 
@@ -122,11 +122,13 @@ async function connectWA(chat) {
     }
 
     let ver;
-    try { const r = await timeout(fetchLatestBaileysVersion(), 10000, null); ver = r ? r.version : [2, 3000, 1015901307]; }
-    catch (_) { ver = [2, 3000, 1015901307]; }
+    try { const r = await timeout(fetchLatestBaileysVersion(), 10000, null); ver = r?.version; }
+    catch (_) { ver = undefined; }
 
     try {
-        sock = makeWASocket({ version: ver, auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) }, logger: log, printQRInTerminal: false, browser: ["DIGI Bot", "Chrome", "1.0"], connectTimeoutMs: 30000, defaultQueryTimeoutMs: 20000, keepAliveIntervalMs: 15000, emitOwnEvents: false, generateHighQualityLinkPreview: false });
+        const opts = { auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) }, logger: log, printQRInTerminal: false, browser: ["DIGI Bot", "Chrome", "22.0"], connectTimeoutMs: 45000, defaultQueryTimeoutMs: 25000, keepAliveIntervalMs: 15000, emitOwnEvents: false, generateHighQualityLinkPreview: false };
+        if (ver) opts.version = ver;
+        sock = makeWASocket(opts);
     } catch (e) {
         connecting = false;
         if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
@@ -142,22 +144,27 @@ async function connectWA(chat) {
 
         if (qr) {
             qrN++;
-            if (qrN > 1) return;
+            // Reiniciar timer cada QR nuevo
             qrStart = Date.now();
             clearTimeout(qrTimer);
             qrTimer = setTimeout(() => {
                 if (!connected && qrStart) {
                     const c = chat, m = qrMsgId;
                     destroy();
-                    if (c && m) editCaption(c, m, "⏰ *Tiempo agotado (60s)*\n\nPulsa 📱 *Conectar* de nuevo.", kb.main().reply_markup);
+                    if (c && m) editCaption(c, m, "⏰ *Tiempo agotado*\n\nPulsa 📱 *Conectar* de nuevo.", kb.main().reply_markup);
                     else if (c) send(c, "⏰ *QR expirado.* Pulsa 📱 Conectar.", kb.main());
                 }
             }, QR_MS);
 
             QRCode.toBuffer(qr, { scale: 8 }).then(async buf => {
                 if (!chat) return;
+                // Borrar mensaje previo (QR anterior o "Conectando...")
+                if (qrMsgId) { bot.deleteMessage(chat, qrMsgId).catch(() => {}); qrMsgId = null; }
                 if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
-                const m = await bot.sendPhoto(chat, buf, { caption: "📱 *Escanea este QR* (60s)\n\n1️⃣ WhatsApp → ⋮ → Dispositivos vinculados\n2️⃣ Vincular dispositivo\n3️⃣ Escanea el código", parse_mode: "Markdown", reply_markup: kb.cancel() }).catch(() => null);
+                const cap = qrN > 1
+                    ? `📱 *Nuevo QR (${qrN})* — Escanéalo\n\n1️⃣ WhatsApp → ⋮ → Dispositivos vinculados\n2️⃣ Vincular dispositivo\n3️⃣ Escanea el código`
+                    : `📱 *Escanea este QR*\n\n1️⃣ WhatsApp → ⋮ → Dispositivos vinculados\n2️⃣ Vincular dispositivo\n3️⃣ Escanea el código`;
+                const m = await bot.sendPhoto(chat, buf, { caption: cap, parse_mode: "Markdown", reply_markup: kb.cancel() }).catch(() => null);
                 if (m) qrMsgId = m.message_id;
             }).catch(() => {});
         }
