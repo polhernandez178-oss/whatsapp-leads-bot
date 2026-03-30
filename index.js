@@ -1,1482 +1,480 @@
 #!/usr/bin/env node
-// ╔══════════════════════════════════════════════════════════════════╗
-// ║     BOT VALIDADOR DIGI v9.2 — Baileys + Botones + Filtro       ║
-// ╠══════════════════════════════════════════════════════════════════╣
-// ║  🆓 Sin GreenAPI • Sin límites • Sin pagos                       ║
-// ║  📱 Baileys (WhatsApp Web directo)                               ║
-// ║  🎛️ Menú con botones inline en Telegram                          ║
-// ║  👤 Modo Leads Dedicados: solo con nombre real                   ║
-// ║  🎯 Filtro: Solo DIGI o Todos los prefijos                       ║
-// ║  🛡️ 1 solo QR • Live message • Botón cancelar                    ║
-// ║  ⚡ Arranque rápido — /start responde al instante                ║
-// ╚══════════════════════════════════════════════════════════════════╝
-
+// Bot Validador DIGI v10 — Solo DIGI • Prefijos CNMC verificados
 "use strict";
 
-// ================================================================
-//  CONFIGURACIÓN
-// ================================================================
-
-const TELEGRAM_TOKEN = "8710402523:AAHzR-ZQ8XR_qSJSOzJ6VPFIZYD1HnLoJtA";
-
-const PREFIJOS_DIGI = ["34641", "34642", "34643", "34644", "34645"];
-const PREFIJOS_TODOS = [
-    "34610", "34611", "34612", "34613", "34614", "34615", "34616", "34617", "34618", "34619",
-    "34620", "34621", "34622", "34623", "34624", "34625", "34626", "34627", "34628", "34629",
-    "34630", "34631", "34632", "34633", "34634", "34635", "34636", "34637", "34638", "34639",
-    "34640", "34641", "34642", "34643", "34644", "34645", "34646", "34647", "34648", "34649",
-    "34650", "34651", "34652", "34653", "34654", "34655", "34656", "34657", "34658", "34659",
-    "34660", "34661", "34662", "34663", "34664", "34665", "34666", "34667", "34668", "34669",
-    "34670", "34671", "34672", "34673", "34674", "34675", "34676", "34677", "34678", "34679",
-    "34680", "34681", "34682", "34683", "34684", "34685", "34686", "34687", "34688", "34689",
-    "34690", "34691", "34692", "34693", "34694", "34695", "34696", "34697", "34698", "34699",
-    "34711", "34712", "34713", "34714", "34715", "34716", "34717", "34718", "34719",
-    "34720", "34721", "34722", "34723", "34724", "34725", "34726", "34727", "34728", "34729",
-    "34740", "34741", "34742", "34743", "34744", "34745", "34746", "34747", "34748", "34749",
-];
-const BATCH_SIZE = 20;
-const DELAY_ENTRE_LOTES_MS = 3000;
-const NOTIFICAR_CADA = 50;
-const ARCHIVO_RESULTADOS = "numeros_validados.csv";
-const AUTH_DIR = "./auth_session";
-const MAX_ERRORES_SEGUIDOS = 15;
-
-// ── LÍMITES ANTI-BUCLE ──
-const QR_TIMEOUT_MS = 60000;          // 60s para escanear el QR
-const MAX_RECONNECT_INTENTOS = 5;
-const RECONNECT_DELAY_MS = 5000;
-const RECONNECT_BACKOFF_MULT = 1.5;
-
-// ================================================================
-//  IMPORTS
-// ================================================================
-
-const {
-    default: makeWASocket,
-    useMultiFileAuthState,
-    DisconnectReason,
-    makeCacheableSignalKeyStore,
-    fetchLatestBaileysVersion,
-} = require("@whiskeysockets/baileys");
+const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
 const TelegramBot = require("node-telegram-bot-api");
 const QRCode = require("qrcode");
 const pino = require("pino");
 const fs = require("fs");
-const path = require("path");
 
-const logger = pino({ level: "silent" });
+// ── CONFIG ──
+const TOKEN = "8710402523:AAHzR-ZQ8XR_qSJSOzJ6VPFIZYD1HnLoJtA";
+const AUTH = "./auth_session";
+const CSV = "numeros_validados.csv";
+const BATCH = 20;
+const DELAY = 3000;
+const NOTIFY = 50;
+const MAX_ERR = 15;
+const QR_MS = 60000;
+const MAX_RECONN = 5;
 
-// ================================================================
-//  ESTADO GLOBAL
-// ================================================================
+// ── PREFIJOS DIGI ──
+const PREFIJOS = ["34614", "34624", "34641", "34642", "34643"];
 
-let sock = null;
-let isConnected = false;
-let isConnecting = false;
-let qrTimeout = null;
-let qrCount = 0;
-let reconnectCount = 0;
-let reconnectTimer = null;
-let connectionChatId = null;
+// ── ESTADO ──
+const log = pino({ level: "silent" });
+let sock = null, connected = false, connecting = false;
+let qrTimer = null, qrMsgId = null, qrStart = null, connMsgId = null;
+let qrN = 0, reconnN = 0, reconnTimer = null, connChat = null;
 
-// ── Estado del QR live message ──
-let qrMessageId = null;       // ID del mensaje de foto QR en Telegram
-let qrStartTime = null;       // Timestamp de cuando se mostró el primer QR
-let connectingMessageId = null; // ID del mensaje "Conectando..." para borrarlo
+const val = { on: false, stop: false, target: 0, scanned: 0, valid: 0, skip: 0, err: 0, errRow: 0, start: null, chat: null, lastN: 0, lastErr: "", mode: "leads" };
+const checked = new Set();
+const names = new Map();
+const waitAmt = new Map();
 
-const validation = {
-    active: false,
-    stopRequested: false,
-    target: 0,
-    scanned: 0,
-    valid: 0,
-    skippedNoName: 0,
-    errors: 0,
-    errorsInRow: 0,
-    startTime: null,
-    chatId: null,
-    lastNotify: 0,
-    lastError: "",
-    mode: "leads",
-    filter: "digi",
+// ── TELEGRAM ──
+const bot = new TelegramBot(TOKEN, { polling: true });
+bot.on("polling_error", e => { if (e.code !== "ETELEGRAM" || !e.message?.includes("409")) console.error("[TG]", e.code || e.message); });
+bot.on("error", e => console.error("[TG]", e.message));
+
+const send = (id, txt, ex = {}) => id ? bot.sendMessage(id, txt, { parse_mode: "Markdown", ...ex }).catch(() => null) : Promise.resolve(null);
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const timeout = (p, ms, fb = null) => { let t; return Promise.race([p, new Promise(r => { t = setTimeout(() => r(fb), ms); })]).finally(() => clearTimeout(t)); };
+const fmtTime = ms => { if (!ms || ms < 0) return "—"; const s = Math.floor(ms/1000), h = Math.floor(s/3600), m = Math.floor(s%3600/60); return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s%60}s`; };
+
+// ── TECLADOS ──
+const kb = {
+    main: () => ({ reply_markup: { inline_keyboard: [
+        [{ text: "📱 Conectar WhatsApp", callback_data: "connect" }],
+        [{ text: "🚀 Validar DIGI", callback_data: "validate" }],
+        [{ text: "📊 Estado", callback_data: "status" }, { text: "📥 CSV", callback_data: "download" }],
+        [{ text: "🔌 Desconectar", callback_data: "disconnect" }],
+    ]}}),
+    cancel: () => ({ inline_keyboard: [[{ text: "❌ Cancelar", callback_data: "cancel_qr" }]] }),
+    amount: () => ({ reply_markup: { inline_keyboard: [
+        [{ text: "2.000", callback_data: "n_2000" }, { text: "4.000", callback_data: "n_4000" }],
+        [{ text: "6.000", callback_data: "n_6000" }, { text: "8.000", callback_data: "n_8000" }],
+        [{ text: "🔟 10.000", callback_data: "n_10000" }],
+        [{ text: "✏️ Personalizada", callback_data: "n_custom" }],
+        [{ text: "🔙 Menú", callback_data: "main" }],
+    ]}}),
+    mode: n => ({ reply_markup: { inline_keyboard: [
+        [{ text: "👥 Leads", callback_data: `go_leads_${n}` }],
+        [{ text: "⭐ Dedicados (con nombre)", callback_data: `go_dedicados_${n}` }],
+        [{ text: "🔙 Cantidad", callback_data: "validate" }],
+    ]}}),
+    running: () => ({ reply_markup: { inline_keyboard: [[{ text: "📊 Estado", callback_data: "status" }, { text: "⛔ PARAR", callback_data: "stop" }]] }}),
+    done: () => ({ reply_markup: { inline_keyboard: [
+        [{ text: "📥 CSV", callback_data: "download" }, { text: "🚀 Nueva", callback_data: "validate" }],
+        [{ text: "🏠 Menú", callback_data: "main" }],
+    ]}}),
 };
 
-const alreadyChecked = new Set();
-const contactNames = new Map();
-
-// ================================================================
-//  TELEGRAM BOT — polling: true (simple y fiable)
-// ================================================================
-
-const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: true });
-
-// 🛡️ Manejar errores de polling para que no crashee
-bot.on("polling_error", (err) => {
-    if (err.code !== "ETELEGRAM" || !err.message?.includes("409")) {
-        console.error("[TG] Error de polling:", err.code || err.message);
-    }
-});
-
-bot.on("error", (err) => {
-    console.error("[TG] Error general:", err.message);
-});
-
-function send(chatId, text, extra = {}) {
-    if (!chatId) return Promise.resolve(null);
-    return bot.sendMessage(chatId, text, { parse_mode: "Markdown", ...extra }).catch((e) => {
-        console.error("[TG] Error enviando:", e.message);
-        return null;
-    });
+// ── GENERAR NÚMERO DIGI ──
+function genNum() {
+    const pfx = PREFIJOS[Math.floor(Math.random() * PREFIJOS.length)];
+    const suf = String(Math.floor(Math.random() * 1e6)).padStart(6, "0");
+    return pfx + suf;
 }
 
-// ================================================================
-//  TECLADOS (BOTONES INLINE)
-// ================================================================
-
-function mainMenuKeyboard() {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: "📱 Conectar WhatsApp", callback_data: "cmd_conectar" }],
-                [{ text: "🚀 Iniciar Validación", callback_data: "menu_validar" }],
-                [
-                    { text: "📊 Estado", callback_data: "cmd_estado" },
-                    { text: "📥 Descargar CSV", callback_data: "cmd_descargar" },
-                ],
-                [{ text: "🔌 Desconectar", callback_data: "cmd_desconectar" }],
-            ],
-        },
-    };
-}
-
-function qrCancelKeyboard() {
-    return {
-        inline_keyboard: [
-            [{ text: "❌ Cancelar", callback_data: "cmd_cancelar_qr" }],
-        ],
-    };
-}
-
-function cantidadKeyboard() {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: "2.000", callback_data: "cant_2000" },
-                    { text: "4.000", callback_data: "cant_4000" },
-                ],
-                [
-                    { text: "6.000", callback_data: "cant_6000" },
-                    { text: "8.000", callback_data: "cant_8000" },
-                ],
-                [{ text: "🔟 10.000", callback_data: "cant_10000" }],
-                [{ text: "✏️ Cantidad personalizada", callback_data: "cant_custom" }],
-                [{ text: "🔙 Menú principal", callback_data: "menu_main" }],
-            ],
-        },
-    };
-}
-
-function modeKeyboard(cantidad) {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: "👥 Leads", callback_data: `mode_leads_${cantidad}` }],
-                [{ text: "⭐ Leads Dedicados", callback_data: `mode_dedicados_${cantidad}` }],
-                [{ text: "🔙 Cambiar cantidad", callback_data: "menu_validar" }],
-            ],
-        },
-    };
-}
-
-function filterKeyboard(cantidad, mode) {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [{ text: "🎯 Solo prefijos DIGI", callback_data: `filter_digi_${mode}_${cantidad}` }],
-                [{ text: "🌐 Todos los prefijos", callback_data: `filter_todos_${mode}_${cantidad}` }],
-                [{ text: "🔙 Cambiar modo", callback_data: `cant_${cantidad}` }],
-            ],
-        },
-    };
-}
-
-function validatingKeyboard() {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: "📊 Ver estado", callback_data: "cmd_estado" },
-                    { text: "⛔ PARAR", callback_data: "cmd_parar" },
-                ],
-            ],
-        },
-    };
-}
-
-function postValidationKeyboard() {
-    return {
-        reply_markup: {
-            inline_keyboard: [
-                [
-                    { text: "📥 Descargar CSV", callback_data: "cmd_descargar" },
-                    { text: "🚀 Nueva validación", callback_data: "menu_validar" },
-                ],
-                [{ text: "🏠 Menú principal", callback_data: "menu_main" }],
-            ],
-        },
-    };
-}
-
-// ================================================================
-//  UTILIDADES
-// ================================================================
-
-function generateNumber(filter) {
-    const prefixes = filter === "digi" ? PREFIJOS_DIGI : PREFIJOS_TODOS;
-    const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-    const suffix = String(Math.floor(Math.random() * 1000000)).padStart(6, "0");
-    return prefix + suffix;
-}
-
-function loadAlreadyValidated() {
-    if (!fs.existsSync(ARCHIVO_RESULTADOS)) return;
+// ── CSV ──
+function loadCSV() {
+    if (!fs.existsSync(CSV)) return;
     try {
-        const content = fs.readFileSync(ARCHIVO_RESULTADOS, "utf-8");
-        const lines = content.split("\n").slice(1);
-        for (const line of lines) {
-            const parts = line.split(",");
-            if (parts.length >= 2) {
-                alreadyChecked.add(parts[1].trim().replace(/"/g, ""));
-            }
-        }
-        console.log(`[CSV] Cargados ${alreadyChecked.size} números previos`);
+        const lines = fs.readFileSync(CSV, "utf-8").split("\n").slice(1);
+        for (const l of lines) { const p = l.split(","); if (p.length >= 2) checked.add(p[1].trim().replace(/"/g, "")); }
+        console.log(`[CSV] ${checked.size} previos`);
     } catch (_) {}
 }
 
-function saveNumber(number, name = "Sin nombre") {
+function saveNum(num, name = "Sin nombre") {
     try {
-        const safeName = name.replace(/"/g, '""');
-        const exists = fs.existsSync(ARCHIVO_RESULTADOS);
-        const line = exists
-            ? `\n"${safeName}","${number}"`
-            : `"Nombre","Telefono"\n"${safeName}","${number}"`;
-        fs.appendFileSync(ARCHIVO_RESULTADOS, line, "utf-8");
-    } catch (e) {
-        console.error("[CSV] Error guardando número:", e.message);
-    }
+        const exists = fs.existsSync(CSV);
+        fs.appendFileSync(CSV, exists ? `\n"${name.replace(/"/g, '""')}","${num}"` : `"Nombre","Telefono"\n"${name.replace(/"/g, '""')}","${num}"`, "utf-8");
+    } catch (_) {}
 }
 
-function formatTime(ms) {
-    if (!ms || ms < 0 || !isFinite(ms)) return "—";
-    const s = Math.floor(ms / 1000);
-    const h = Math.floor(s / 3600);
-    const m = Math.floor((s % 3600) / 60);
-    const sec = s % 60;
-    if (h > 0) return `${h}h ${m}m ${sec}s`;
-    if (m > 0) return `${m}m ${sec}s`;
-    return `${sec}s`;
+// ── WHATSAPP ──
+function destroy() {
+    clearTimeout(qrTimer); qrTimer = null;
+    clearTimeout(reconnTimer); reconnTimer = null;
+    qrMsgId = null; qrStart = null; connMsgId = null; qrN = 0;
+    if (sock) { try { sock.ev.removeAllListeners(); sock.end(undefined); } catch (_) {} sock = null; }
+    connected = false; connecting = false;
 }
 
-function sleep(ms) {
-    return new Promise((resolve) => setTimeout(resolve, ms));
+function editCaption(chat, msg, txt, rm) {
+    if (!chat || !msg) return Promise.resolve();
+    return bot.editMessageCaption(txt, { chat_id: chat, message_id: msg, parse_mode: "Markdown", reply_markup: rm }).catch(() => send(chat, txt, rm ? { reply_markup: rm } : kb.main()));
 }
 
-function withTimeout(promise, ms, fallback = null) {
-    let timer;
-    return Promise.race([
-        promise,
-        new Promise((resolve) => {
-            timer = setTimeout(() => resolve(fallback), ms);
-        }),
-    ]).finally(() => clearTimeout(timer));
-}
+async function connectWA(chat) {
+    if (connecting) { if (chat) send(chat, "⏳ *Ya conectando...*"); return; }
+    if (connected && sock) return;
+    destroy(); connecting = true; connChat = chat;
 
-// ================================================================
-//  HELPER: Editar caption del mensaje QR (live message)
-// ================================================================
-
-function editQrCaption(chatId, messageId, text, replyMarkup) {
-    if (!chatId || !messageId) return Promise.resolve();
-    return bot.editMessageCaption(text, {
-        chat_id: chatId,
-        message_id: messageId,
-        parse_mode: "Markdown",
-        reply_markup: replyMarkup || undefined,
-    }).catch((e) => {
-        // Si falla editMessageCaption (ej: mensaje ya borrado), enviar nuevo mensaje
-        console.error("[TG] Error editando caption:", e.message);
-        return send(chatId, text, replyMarkup ? { reply_markup: replyMarkup } : mainMenuKeyboard());
-    });
-}
-
-// ================================================================
-//  WHATSAPP — LIMPIEZA DE SOCKET
-// ================================================================
-
-function destroySocket() {
-    clearTimeout(qrTimeout);
-    qrTimeout = null;
-    clearTimeout(reconnectTimer);
-    reconnectTimer = null;
-
-    // Limpiar estado QR
-    qrMessageId = null;
-    qrStartTime = null;
-    connectingMessageId = null;
-    qrCount = 0;
-
-    if (sock) {
-        try {
-            sock.ev.removeAllListeners();
-            sock.end(undefined);
-        } catch (_) {}
-        sock = null;
-    }
-    isConnected = false;
-    isConnecting = false;
-}
-
-// ================================================================
-//  WHATSAPP — CONEXIÓN (1 SOLO QR, LIVE MESSAGE, 60s TIMEOUT)
-// ================================================================
-
-async function connectWhatsApp(chatId) {
-    // 🛡️ GUARDIA: evitar conexiones simultáneas
-    if (isConnecting) {
-        console.log("[WA] Ya hay una conexión en progreso, ignorando...");
-        if (chatId) send(chatId, "⏳ *Ya se está conectando...*\nEspera un momento.");
-        return;
-    }
-    if (isConnected && sock) {
-        console.log("[WA] Ya está conectado, ignorando...");
-        return;
+    let state, save;
+    try { ({ state, saveCreds: save } = await useMultiFileAuthState(AUTH)); } catch (e) {
+        connecting = false;
+        if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
+        if (chat) send(chat, "❌ Error sesión.", kb.main()); return;
     }
 
-    // Limpiar cualquier socket previo
-    destroySocket();
-
-    isConnecting = true;
-    connectionChatId = chatId;
-
-    console.log("[WA] Iniciando conexión...");
-
-    let state, saveCreds;
-    try {
-        ({ state, saveCreds } = await useMultiFileAuthState(AUTH_DIR));
-    } catch (e) {
-        console.error("[WA] Error cargando estado de auth:", e.message);
-        isConnecting = false;
-        if (chatId) {
-            // Borrar mensaje "Conectando..." si existe
-            if (connectingMessageId) {
-                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-                connectingMessageId = null;
-            }
-            send(chatId, "❌ Error cargando sesión. Intenta de nuevo.", mainMenuKeyboard());
-        }
-        return;
-    }
-
-    // ⚡ Obtener versión con timeout de 10s
-    let version;
-    try {
-        const versionResult = await withTimeout(fetchLatestBaileysVersion(), 10000, null);
-        if (versionResult) {
-            version = versionResult.version;
-        } else {
-            console.log("[WA] Timeout obteniendo versión, usando default...");
-            version = [2, 3000, 1015901307];
-        }
-    } catch (e) {
-        console.log("[WA] Error obteniendo versión, usando default:", e.message);
-        version = [2, 3000, 1015901307];
-    }
-
-    console.log(`[WA] Versión: ${version.join(".")}`);
+    let ver;
+    try { const r = await timeout(fetchLatestBaileysVersion(), 10000, null); ver = r ? r.version : [2, 3000, 1015901307]; }
+    catch (_) { ver = [2, 3000, 1015901307]; }
 
     try {
-        sock = makeWASocket({
-            version,
-            auth: {
-                creds: state.creds,
-                keys: makeCacheableSignalKeyStore(state.keys, logger),
-            },
-            logger,
-            printQRInTerminal: false,
-            browser: ["DIGI Validator", "Chrome", "1.0"],
-            connectTimeoutMs: 30000,
-            defaultQueryTimeoutMs: 20000,
-            keepAliveIntervalMs: 15000,
-            emitOwnEvents: false,
-            generateHighQualityLinkPreview: false,
-        });
+        sock = makeWASocket({ version: ver, auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, log) }, logger: log, printQRInTerminal: false, browser: ["DIGI Bot", "Chrome", "1.0"], connectTimeoutMs: 30000, defaultQueryTimeoutMs: 20000, keepAliveIntervalMs: 15000, emitOwnEvents: false, generateHighQualityLinkPreview: false });
     } catch (e) {
-        console.error("[WA] Error creando socket:", e.message);
-        isConnecting = false;
-        if (chatId) {
-            if (connectingMessageId) {
-                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-                connectingMessageId = null;
-            }
-            send(chatId, "❌ Error creando conexión. Intenta de nuevo.", mainMenuKeyboard());
-        }
-        return;
+        connecting = false;
+        if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
+        if (chat) send(chat, "❌ Error conexión.", kb.main()); return;
     }
 
-    // Cache de contactos
-    sock.ev.on("contacts.upsert", (contacts) => {
-        for (const c of contacts) {
-            const name = c.notify || c.verifiedName || c.name;
-            if (name) contactNames.set(c.id, name);
-        }
-    });
-    sock.ev.on("contacts.update", (updates) => {
-        for (const u of updates) {
-            const name = u.notify || u.verifiedName || u.name;
-            if (name) contactNames.set(u.id, name);
-        }
-    });
+    sock.ev.on("contacts.upsert", cc => { for (const c of cc) { const n = c.notify || c.verifiedName || c.name; if (n) names.set(c.id, n); } });
+    sock.ev.on("contacts.update", cc => { for (const c of cc) { const n = c.notify || c.verifiedName || c.name; if (n) names.set(c.id, n); } });
+    sock.ev.on("creds.update", save);
 
-    sock.ev.on("creds.update", saveCreds);
+    sock.ev.on("connection.update", up => {
+        const { connection, lastDisconnect, qr } = up;
 
-    sock.ev.on("connection.update", (update) => {
-        const { connection, lastDisconnect, qr } = update;
-
-        // ══════════════════════════════════════════
-        //  QR RECIBIDO — SOLO 1 QR, LIVE MESSAGE
-        // ══════════════════════════════════════════
         if (qr) {
-            qrCount++;
-            console.log(`[WA] QR #${qrCount} recibido`);
-
-            // 🛡️ Solo mostramos el PRIMER QR al usuario
-            // Los siguientes (refresh de Baileys) se ignoran
-            if (qrCount > 1) {
-                console.log(`[WA] QR #${qrCount} ignorado (solo mostramos 1)`);
-                return;
-            }
-
-            qrStartTime = Date.now();
-
-            // ── Timeout global de 60 segundos ──
-            clearTimeout(qrTimeout);
-            qrTimeout = setTimeout(() => {
-                if (!isConnected && qrStartTime) {
-                    console.log("[WA] ⏰ Timeout de QR (60s). Cerrando conexión.");
-                    const savedChatId = chatId;
-                    const savedMsgId = qrMessageId;
-                    destroySocket();
-
-                    if (savedChatId && savedMsgId) {
-                        editQrCaption(
-                            savedChatId,
-                            savedMsgId,
-                            "⏰ *Tiempo agotado (60s)*\n\n" +
-                            "❌ No se escaneó el QR a tiempo.\n\n" +
-                            "Pulsa 📱 *Conectar* cuando estés listo.",
-                            mainMenuKeyboard().reply_markup
-                        );
-                    } else if (savedChatId) {
-                        send(savedChatId,
-                            "⏰ *Tiempo agotado*\n\nNo se escaneó el QR.\nPulsa 📱 *Conectar* para intentarlo de nuevo.",
-                            mainMenuKeyboard()
-                        );
-                    }
+            qrN++;
+            if (qrN > 1) return;
+            qrStart = Date.now();
+            clearTimeout(qrTimer);
+            qrTimer = setTimeout(() => {
+                if (!connected && qrStart) {
+                    const c = chat, m = qrMsgId;
+                    destroy();
+                    if (c && m) editCaption(c, m, "⏰ *Tiempo agotado (60s)*\n\nPulsa 📱 *Conectar* de nuevo.", kb.main().reply_markup);
+                    else if (c) send(c, "⏰ *QR expirado.* Pulsa 📱 Conectar.", kb.main());
                 }
-            }, QR_TIMEOUT_MS);
+            }, QR_MS);
 
-            // ── Generar imagen QR y enviar como foto con botón Cancelar ──
-            QRCode.toBuffer(qr, { scale: 8 })
-                .then(async (buffer) => {
-                    if (!chatId) return;
-
-                    // Borrar mensaje "Conectando..." si existe
-                    if (connectingMessageId) {
-                        bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-                        connectingMessageId = null;
-                    }
-
-                    const caption =
-                        `📱 *Escanea este QR*\n\n` +
-                        `⏳ Tienes *60 segundos*...\n\n` +
-                        `1️⃣ Abre WhatsApp → ⋮ → *Dispositivos vinculados*\n` +
-                        `2️⃣ Toca _Vincular dispositivo_\n` +
-                        `3️⃣ Escanea este código QR`;
-
-                    const sentMsg = await bot.sendPhoto(chatId, buffer, {
-                        caption,
-                        parse_mode: "Markdown",
-                        reply_markup: qrCancelKeyboard(),
-                    }).catch((e) => {
-                        console.error("[TG] Error enviando QR:", e.message);
-                        return null;
-                    });
-
-                    if (sentMsg) {
-                        qrMessageId = sentMsg.message_id;
-                        console.log(`[WA] QR enviado como mensaje #${qrMessageId}`);
-                    }
-                })
-                .catch((e) => {
-                    console.error("[QR] Error generando imagen:", e.message);
-                });
+            QRCode.toBuffer(qr, { scale: 8 }).then(async buf => {
+                if (!chat) return;
+                if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
+                const m = await bot.sendPhoto(chat, buf, { caption: "📱 *Escanea este QR* (60s)\n\n1️⃣ WhatsApp → ⋮ → Dispositivos vinculados\n2️⃣ Vincular dispositivo\n3️⃣ Escanea el código", parse_mode: "Markdown", reply_markup: kb.cancel() }).catch(() => null);
+                if (m) qrMsgId = m.message_id;
+            }).catch(() => {});
         }
 
-        // ══════════════════════════════════════════
-        //  CONEXIÓN ABIERTA → Editar QR a ✅
-        // ══════════════════════════════════════════
         if (connection === "open") {
-            isConnected = true;
-            isConnecting = false;
-            reconnectCount = 0;
-            clearTimeout(qrTimeout);
-            qrTimeout = null;
-
-            const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
-            console.log(`[WA] ✅ Conectado como +${phone}`);
-
-            const successText =
-                `✅ *¡WhatsApp conectado!*\n\n` +
-                `📱 Número: +${phone}\n` +
-                `🟢 Estado: Activo\n\n` +
-                `_Listo para validar_`;
-
-            if (chatId && qrMessageId) {
-                // ── LIVE MESSAGE: editar el caption de la foto QR ──
-                editQrCaption(chatId, qrMessageId, successText, mainMenuKeyboard().reply_markup);
-                qrMessageId = null;
-            } else if (chatId) {
-                // Si no hay foto QR (ej: reconexión automática), mensaje nuevo
-                // Borrar "Conectando..." si existe
-                if (connectingMessageId) {
-                    bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-                    connectingMessageId = null;
-                }
-                send(chatId, successText, mainMenuKeyboard());
-            }
-
-            qrStartTime = null;
+            connected = true; connecting = false; reconnN = 0;
+            clearTimeout(qrTimer); qrTimer = null;
+            const ph = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
+            const txt = `✅ *WhatsApp conectado*\n📱 +${ph}\n\n_Listo para DIGI 🟢_`;
+            if (chat && qrMsgId) { editCaption(chat, qrMsgId, txt, kb.main().reply_markup); qrMsgId = null; }
+            else if (chat) { if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; } send(chat, txt, kb.main()); }
+            qrStart = null;
         }
 
-        // ══════════════════════════════════════════
-        //  CONEXIÓN CERRADA
-        // ══════════════════════════════════════════
         if (connection === "close") {
-            const wasConnected = isConnected;
-            isConnected = false;
-            isConnecting = false;
-            clearTimeout(qrTimeout);
-            qrTimeout = null;
-
+            const was = connected; connected = false; connecting = false;
+            clearTimeout(qrTimer); qrTimer = null;
             const code = lastDisconnect?.error?.output?.statusCode;
-            const msg = lastDisconnect?.error?.message || "desconocido";
-            console.log(`[WA] Desconectado. Código: ${code} | Motivo: ${msg}`);
+            const msg = lastDisconnect?.error?.message || "?";
+            const savedQr = qrMsgId; qrMsgId = null; qrStart = null;
 
-            // ── Si teníamos QR visible y NO nos conectamos → editar a error ──
-            const savedQrMsgId = qrMessageId;
-            qrMessageId = null;
-            qrStartTime = null;
-
-            // ── Sesión cerrada (loggedOut) → borrar credenciales, NO reconectar ──
             if (code === DisconnectReason.loggedOut) {
-                console.log("[WA] Sesión cerrada por el usuario. Borrando credenciales...");
-                try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
+                try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
                 sock = null;
-
-                if (chatId && savedQrMsgId) {
-                    editQrCaption(chatId, savedQrMsgId,
-                        "🔴 *Sesión cerrada*\n\nSe han eliminado las credenciales.\nUsa 📱 *Conectar* para vincular de nuevo.",
-                        mainMenuKeyboard().reply_markup
-                    );
-                } else if (chatId) {
-                    send(chatId,
-                        "🔴 *Sesión cerrada*\n\nSe han eliminado las credenciales.\nUsa 📱 *Conectar* para vincular de nuevo.",
-                        mainMenuKeyboard()
-                    );
-                }
+                const t = "🔴 *Sesión cerrada*\nUsa 📱 Conectar para vincular.";
+                if (chat && savedQr) editCaption(chat, savedQr, t, kb.main().reply_markup);
+                else if (chat) send(chat, t, kb.main());
                 return;
             }
 
-            // ── Si había QR mostrándose y la conexión cerró (QR expirado internamente) ──
-            if (savedQrMsgId && !wasConnected && chatId) {
-                editQrCaption(chatId, savedQrMsgId,
-                    "❌ *No se pudo vincular*\n\n" +
-                    "El QR ha expirado o hubo un error.\n\n" +
-                    "Pulsa 📱 *Conectar* para intentarlo de nuevo.",
-                    mainMenuKeyboard().reply_markup
-                );
-                sock = null;
-                return;
+            if (savedQr && !was && chat) {
+                editCaption(chat, savedQr, "❌ *No se pudo vincular*\nPulsa 📱 Conectar.", kb.main().reply_markup);
+                sock = null; return;
             }
 
-            // ── Solo reconectar si hay sesión guardada ──
-            const hasSession = fs.existsSync(AUTH_DIR) &&
-                               (() => { try { return fs.readdirSync(AUTH_DIR).length > 0; } catch(_) { return false; } })();
+            const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
+            if (!has) { sock = null; if (chat) send(chat, "🔴 Sin sesión. Usa 📱 Conectar.", kb.main()); return; }
 
-            if (!hasSession) {
-                console.log("[WA] No hay sesión guardada. No reconectar.");
-                sock = null;
-                if (chatId) {
-                    send(chatId,
-                        "🔴 *Conexión perdida*\nNo hay sesión guardada. Usa 📱 *Conectar* para vincular.",
-                        mainMenuKeyboard()
-                    );
-                }
-                return;
-            }
+            reconnN++;
+            if (reconnN > MAX_RECONN) { destroy(); if (chat) send(chat, `⚠️ *No reconectó tras ${MAX_RECONN} intentos.*\nPulsa 📱 Conectar.`, kb.main()); return; }
 
-            reconnectCount++;
-            console.log(`[WA] Intento de reconexión ${reconnectCount}/${MAX_RECONNECT_INTENTOS}`);
-
-            // 🛡️ ANTI-BUCLE: máximo de reconexiones
-            if (reconnectCount > MAX_RECONNECT_INTENTOS) {
-                console.log("[WA] Máximo de reconexiones alcanzado. Parando.");
-                destroySocket();
-                if (chatId) {
-                    send(chatId,
-                        `⚠️ *No se pudo reconectar tras ${MAX_RECONNECT_INTENTOS} intentos.*\n\n` +
-                        `Último error: \`${msg.slice(0, 80)}\`\n\n` +
-                        `Pulsa 📱 *Conectar* para intentar de nuevo manualmente.`,
-                        mainMenuKeyboard()
-                    );
-                }
-                return;
-            }
-
-            // Reconectar con backoff exponencial
-            const delay = Math.min(
-                RECONNECT_DELAY_MS * Math.pow(RECONNECT_BACKOFF_MULT, reconnectCount - 1),
-                60000
-            );
-
-            if (wasConnected && chatId) {
-                send(chatId,
-                    `⚠️ *WhatsApp desconectado*\n\n` +
-                    `Reconectando en ${Math.round(delay / 1000)}s... ` +
-                    `(${reconnectCount}/${MAX_RECONNECT_INTENTOS})`
-                );
-            }
-
-            // Limpiar socket anterior
-            try {
-                sock.ev.removeAllListeners();
-            } catch (_) {}
-            sock = null;
-
-            clearTimeout(reconnectTimer);
-            reconnectTimer = setTimeout(() => {
-                console.log(`[WA] Reconectando... (intento ${reconnectCount})`);
-                isConnecting = false; // Permitir la reconexión
-                connectWhatsApp(chatId).catch((e) => {
-                    console.error("[WA] Error en reconexión:", e.message);
-                });
-            }, delay);
+            const d = Math.min(5000 * Math.pow(1.5, reconnN - 1), 60000);
+            if (was && chat) send(chat, `⚠️ Reconectando en ${Math.round(d/1000)}s... (${reconnN}/${MAX_RECONN})`);
+            try { sock.ev.removeAllListeners(); } catch (_) {} sock = null;
+            clearTimeout(reconnTimer);
+            reconnTimer = setTimeout(() => { connecting = false; connectWA(chat).catch(() => {}); }, d);
         }
     });
 }
 
-// ================================================================
-//  VERIFICACIÓN DE NÚMEROS
-// ================================================================
-
-async function checkNumbers(numbers) {
-    if (!sock || !isConnected) {
-        return numbers.map(() => null);
-    }
-
+// ── CHECK NÚMEROS ──
+async function checkNums(nums) {
+    if (!sock || !connected) return nums.map(() => null);
     try {
-        const jids = numbers.map((n) => `${n}@s.whatsapp.net`);
-        const results = await withTimeout(sock.onWhatsApp(...jids), 20000, null);
-        if (!results) throw new Error("Timeout en onWhatsApp");
-
-        return numbers.map((num) => {
-            const found = results.find((r) => r.jid.startsWith(num));
-            return found ? found.exists === true : false;
-        });
-    } catch (e) {
-        console.error("[CHECK] Error:", e.message);
-        validation.lastError = e.message;
-        return numbers.map(() => null);
-    }
+        const r = await timeout(sock.onWhatsApp(...nums.map(n => `${n}@s.whatsapp.net`)), 20000, null);
+        if (!r) throw new Error("Timeout");
+        return nums.map(n => { const f = r.find(x => x.jid.startsWith(n)); return f ? f.exists === true : false; });
+    } catch (e) { val.lastErr = e.message; return nums.map(() => null); }
 }
 
-// ================================================================
-//  OBTENER NOMBRE DE WHATSAPP
-// ================================================================
-
-async function getWhatsAppName(number) {
-    if (!sock || !isConnected) return null;
-
-    const jid = `${number}@s.whatsapp.net`;
-
-    // 1. Cache de contactos
-    const cached = contactNames.get(jid);
-    if (cached) return cached;
-
-    // 2. Business profile
-    try {
-        const biz = await withTimeout(sock.getBusinessProfile(jid), 5000, null);
-        if (biz?.profile?.tag) return biz.profile.tag;
-        if (biz?.description) return biz.description.split("\n")[0].slice(0, 40);
-    } catch (_) {}
-
-    // 3. Store de contactos
-    try {
-        if (sock.store?.contacts?.[jid]) {
-            const c = sock.store.contacts[jid];
-            return c.notify || c.verifiedName || c.name || null;
-        }
-    } catch (_) {}
-
+async function getName(num) {
+    if (!sock || !connected) return null;
+    const jid = `${num}@s.whatsapp.net`;
+    const c = names.get(jid); if (c) return c;
+    try { const b = await timeout(sock.getBusinessProfile(jid), 5000, null); if (b?.profile?.tag) return b.profile.tag; if (b?.description) return b.description.split("\n")[0].slice(0, 40); } catch (_) {}
+    try { if (sock.store?.contacts?.[jid]) { const c = sock.store.contacts[jid]; return c.notify || c.verifiedName || c.name || null; } } catch (_) {}
     return null;
 }
 
-// ================================================================
-//  LOOP DE VALIDACIÓN
-// ================================================================
-
-async function validationLoop() {
-    const { target, chatId, mode, filter } = validation;
-    validation.startTime = Date.now();
-    validation.scanned = 0;
-    validation.valid = 0;
-    validation.skippedNoName = 0;
-    validation.errors = 0;
-    validation.errorsInRow = 0;
-    validation.lastNotify = 0;
-    validation.lastError = "";
-    validation.stopRequested = false;
-
-    console.log(`[VAL] === INICIO: objetivo=${target} | modo=${mode} | filtro=${filter} ===`);
-
-    loadAlreadyValidated();
-
-    let disconnectWaits = 0;
-    const MAX_DISCONNECT_WAITS = 3;
+// ── VALIDACIÓN ──
+async function runValidation() {
+    val.start = Date.now(); val.scanned = 0; val.valid = 0; val.skip = 0; val.err = 0; val.errRow = 0; val.lastN = 0; val.lastErr = ""; val.stop = false;
+    loadCSV();
+    let dcWait = 0;
 
     try {
-        while (validation.valid < target) {
-            if (validation.stopRequested) {
-                console.log("[VAL] Stop solicitado");
-                break;
+        while (val.valid < val.target) {
+            if (val.stop) break;
+
+            if (!connected) {
+                dcWait++;
+                if (dcWait > 3) { send(val.chat, "🚫 *WhatsApp no reconectó.*\nUsa 📱 Conectar.", kb.main()); break; }
+                send(val.chat, `⚠️ Esperando reconexión... (${dcWait}/3)`);
+                let w = 0; while (!connected && w < 30000 && !val.stop) { await sleep(3000); w += 3000; }
+                if (!connected) continue;
+                dcWait = 0; val.errRow = 0; continue;
+            }
+            dcWait = 0;
+
+            if (val.errRow >= MAX_ERR) {
+                send(val.chat, `⚠️ *${val.errRow} errores seguidos*\nPausando 30s...`);
+                await sleep(30000); val.errRow = 0;
+                if (!connected) continue;
             }
 
-            // Manejar desconexión con límite
-            if (!isConnected) {
-                disconnectWaits++;
-
-                if (disconnectWaits > MAX_DISCONNECT_WAITS) {
-                    send(chatId,
-                        "🚫 *WhatsApp no se reconectó tras varios intentos.*\n\n" +
-                        "La validación se ha pausado.\n" +
-                        "Usa 📱 *Conectar* y luego inicia de nuevo.",
-                        mainMenuKeyboard()
-                    );
-                    break;
-                }
-
-                send(chatId,
-                    `⚠️ *WhatsApp desconectado*\n\n` +
-                    `Esperando reconexión... (${disconnectWaits}/${MAX_DISCONNECT_WAITS})\n` +
-                    `_Timeout: 30s_`
-                );
-
-                let waited = 0;
-                while (!isConnected && waited < 30000 && !validation.stopRequested) {
-                    await sleep(3000);
-                    waited += 3000;
-                }
-
-                if (!isConnected) {
-                    continue;
-                }
-
-                console.log("[VAL] Reconectado, continuando validación...");
-                disconnectWaits = 0;
-                validation.errorsInRow = 0;
-                continue;
-            }
-
-            disconnectWaits = 0;
-
-            // Pausa por muchos errores seguidos
-            if (validation.errorsInRow >= MAX_ERRORES_SEGUIDOS) {
-                console.log(`[VAL] ${validation.errorsInRow} errores seguidos. Pausa 30s...`);
-                send(chatId,
-                    `⚠️ *${validation.errorsInRow} errores seguidos*\n` +
-                    `Último: \`${validation.lastError.slice(0, 80)}\`\n` +
-                    `Pausando 30s...`
-                );
-                await sleep(30000);
-                validation.errorsInRow = 0;
-
-                if (!isConnected) continue;
-            }
-
-            // Generar lote
             const batch = [];
-            let attempts = 0;
-            while (batch.length < BATCH_SIZE && attempts < BATCH_SIZE * 20) {
-                attempts++;
-                const num = generateNumber(filter);
-                if (!alreadyChecked.has(num)) {
-                    batch.push(num);
-                    alreadyChecked.add(num);
-                }
-            }
+            let att = 0;
+            while (batch.length < BATCH && att < BATCH * 20) { att++; const n = genNum(); if (!checked.has(n)) { batch.push(n); checked.add(n); } }
+            if (!batch.length) { await sleep(1000); continue; }
 
-            if (batch.length === 0) { await sleep(1000); continue; }
-
-            // Verificar lote
-            const results = await checkNumbers(batch);
+            const res = await checkNums(batch);
 
             for (let i = 0; i < batch.length; i++) {
-                if (validation.stopRequested) break;
-                if (validation.valid >= target) break;
+                if (val.stop || val.valid >= val.target) break;
+                if (res[i] === null) { val.err++; val.errRow++; continue; }
+                val.scanned++; val.errRow = 0;
 
-                const number = batch[i];
-                const result = results[i];
-
-                if (result === null) {
-                    validation.errors++;
-                    validation.errorsInRow++;
-                    continue;
-                }
-
-                validation.scanned++;
-                validation.errorsInRow = 0;
-
-                if (result === true) {
+                if (res[i]) {
                     let name = null;
-                    try {
-                        name = await withTimeout(getWhatsAppName(number), 8000, null);
-                    } catch (_) {}
+                    try { name = await timeout(getName(batch[i]), 8000, null); } catch (_) {}
 
-                    if (mode === "dedicados") {
-                        if (name && name !== "Sin nombre") {
-                            validation.valid++;
-                            saveNumber(number, name);
-                            console.log(`[VAL] ⭐ #${validation.valid}: +${number} → ${name}`);
-                        } else {
-                            validation.skippedNoName++;
-                            console.log(`[VAL] ⏭️ +${number} válido pero sin nombre → descartado`);
-                        }
-                    } else {
-                        validation.valid++;
-                        saveNumber(number, name || "Sin nombre");
-                        console.log(`[VAL] ✅ #${validation.valid}: +${number} (${name || "Sin nombre"})`);
-                    }
+                    if (val.mode === "dedicados") {
+                        if (name && name !== "Sin nombre") { val.valid++; saveNum(batch[i], name); }
+                        else val.skip++;
+                    } else { val.valid++; saveNum(batch[i], name || "Sin nombre"); }
                 }
             }
 
-            // Notificación periódica
-            if (validation.valid > 0 && validation.valid - validation.lastNotify >= NOTIFICAR_CADA) {
-                const elapsed = Date.now() - validation.startTime;
-                const speed = elapsed > 0 ? (validation.scanned / (elapsed / 1000)).toFixed(1) : "0.0";
-                const rate = validation.scanned > 0
-                    ? ((validation.valid / validation.scanned) * 100).toFixed(1)
-                    : "0.0";
-                const eta = validation.valid > 0
-                    ? ((target - validation.valid) / validation.valid) * elapsed
-                    : 0;
-
-                let extraInfo = "";
-                if (mode === "dedicados" && validation.skippedNoName > 0) {
-                    extraInfo = `⏭️ Descartados sin nombre: ${validation.skippedNoName.toLocaleString()}\n`;
-                }
-
-                send(chatId,
-                    `🔔 *Progreso*\n\n` +
-                    `✅ Válidos: *${validation.valid.toLocaleString()}* / ${target.toLocaleString()}\n` +
-                    `🔍 Escaneados: ${validation.scanned.toLocaleString()}\n` +
-                    `${extraInfo}` +
-                    `❌ Errores: ${validation.errors.toLocaleString()}\n` +
-                    `⚡ ${speed} núm/s | Tasa: ${rate}%\n` +
-                    `⏱️ ${formatTime(elapsed)} | ETA: ${formatTime(eta)}`,
-                    validatingKeyboard()
+            if (val.valid > 0 && val.valid - val.lastN >= NOTIFY) {
+                const el = Date.now() - val.start;
+                const spd = (val.scanned / (el / 1000)).toFixed(1);
+                const rate = ((val.valid / val.scanned) * 100).toFixed(1);
+                const eta = ((val.target - val.valid) / val.valid) * el;
+                send(val.chat,
+                    `🔔 *Progreso DIGI*\n\n✅ ${val.valid.toLocaleString()} / ${val.target.toLocaleString()}\n🔍 ${val.scanned.toLocaleString()} escaneados` +
+                    (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
+                    `\n⚡ ${spd}/s • ${rate}%\n⏱️ ${fmtTime(el)} | ETA: ${fmtTime(eta)}`,
+                    kb.running()
                 );
-                validation.lastNotify = validation.valid;
+                val.lastN = val.valid;
             }
-
-            await sleep(DELAY_ENTRE_LOTES_MS);
+            await sleep(DELAY);
         }
-    } catch (e) {
-        console.error("[VAL] Error crítico:", e);
-        send(chatId, `💥 *Error crítico*\n\n\`${String(e).slice(0, 300)}\``, postValidationKeyboard());
-    }
+    } catch (e) { send(val.chat, `💥 *Error:* \`${String(e).slice(0, 200)}\``, kb.done()); }
 
-    // Resumen final
-    validation.active = false;
-    const elapsed = Date.now() - validation.startTime;
-    const stopped = validation.stopRequested;
-
-    let emoji, title;
-    if (stopped) { emoji = "⛔"; title = "Validación detenida"; }
-    else if (validation.valid >= target) { emoji = "🎉"; title = "¡Validación completada!"; }
-    else { emoji = "⚠️"; title = "Validación interrumpida"; }
-
-    const modeStr = mode === "dedicados" ? "⭐ Leads Dedicados" : "👥 Leads";
-    const filterStr = filter === "digi" ? "🎯 Solo DIGI" : "🌐 Todos";
-    let extraFinal = "";
-    if (mode === "dedicados") {
-        extraFinal = `⏭️ Descartados sin nombre: ${validation.skippedNoName.toLocaleString()}\n`;
-    }
-
-    send(chatId,
-        `${emoji} *${title}*\n\n` +
-        `🏷️ Modo: ${modeStr}\n` +
-        `📡 Filtro: ${filterStr}\n` +
-        `📊 *Resumen:*\n` +
-        `✅ Válidos guardados: ${validation.valid.toLocaleString()}\n` +
-        `🔍 Escaneados: ${validation.scanned.toLocaleString()}\n` +
-        `${extraFinal}` +
-        `❌ Errores: ${validation.errors.toLocaleString()}\n` +
-        `⏱️ Tiempo: ${formatTime(elapsed)}`,
-        postValidationKeyboard()
+    val.on = false;
+    const el = Date.now() - val.start;
+    const icon = val.stop ? "⛔" : val.valid >= val.target ? "🎉" : "⚠️";
+    const title = val.stop ? "Detenida" : val.valid >= val.target ? "¡Completada!" : "Interrumpida";
+    send(val.chat,
+        `${icon} *${title}*\n\n📡 DIGI 🟢 | ${val.mode === "dedicados" ? "⭐ Dedicados" : "👥 Leads"}\n` +
+        `✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados` +
+        (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
+        `\n❌ ${val.err.toLocaleString()} errores\n⏱️ ${fmtTime(el)}`,
+        kb.done()
     );
-    console.log(`[VAL] === FIN: ${validation.valid} válidos de ${validation.scanned} escaneados ===`);
 }
 
-// ================================================================
-//  INICIAR VALIDACIÓN
-// ================================================================
-
-function startValidation(chatId, target, mode, filter) {
-    if (!isConnected) {
-        send(chatId, "❌ *WhatsApp no conectado*\n\nUsa 📱 Conectar primero.", mainMenuKeyboard());
-        return;
-    }
-    if (validation.active) {
-        send(chatId, "⚠️ Ya hay una validación en curso.", validatingKeyboard());
-        return;
-    }
-
-    validation.active = true;
-    validation.target = target;
-    validation.chatId = chatId;
-    validation.mode = mode;
-    validation.filter = filter;
-
-    const modeLabel = mode === "dedicados"
-        ? "⭐ *LEADS DEDICADOS*\n_Solo números con nombre real_"
-        : "👥 *LEADS*\n_Todos los números válidos_";
-
-    const filterLabel = filter === "digi"
-        ? "🎯 Solo prefijos DIGI (641-645)"
-        : "🌐 Todos los prefijos móviles";
-
-    send(chatId,
-        `🚀 *Validación iniciada*\n\n` +
-        `${modeLabel}\n` +
-        `📡 ${filterLabel}\n\n` +
-        `🎯 Objetivo: *${target.toLocaleString()}* válidos\n` +
-        `📦 Lote: ${BATCH_SIZE} números/consulta\n` +
-        `🔔 Aviso cada ${NOTIFICAR_CADA} válidos\n\n` +
-        `_100% gratis con Baileys 🆓_`,
-        validatingKeyboard()
+function startVal(chat, target, mode) {
+    if (!connected) { send(chat, "❌ *WhatsApp no conectado*\nUsa 📱 Conectar.", kb.main()); return; }
+    if (val.on) { send(chat, "⚠️ Ya hay validación en curso.", kb.running()); return; }
+    val.on = true; val.target = target; val.chat = chat; val.mode = mode;
+    send(chat,
+        `🚀 *Validación DIGI iniciada*\n\n${mode === "dedicados" ? "⭐ Dedicados (solo con nombre)" : "👥 Leads (todos)"}\n` +
+        `🎯 ${target.toLocaleString()} números\n📡 ${PREFIJOS.length} prefijos CNMC`,
+        kb.running()
     );
-
-    validationLoop().catch((e) => {
-        console.error("[VAL] Error no capturado:", e);
-        validation.active = false;
-        send(chatId, `💥 *Error inesperado*: \`${e.message}\``, postValidationKeyboard());
-    });
+    runValidation().catch(e => { val.on = false; send(chat, `💥 \`${e.message}\``, kb.done()); });
 }
 
-// ================================================================
-//  ESTADO PARA CALLBACKS
-// ================================================================
-
-const waitingCustomAmount = new Map();
-
-// ================================================================
-//  CALLBACK QUERIES (BOTONES)
-// ================================================================
-
-bot.on("callback_query", async (query) => {
-    const chatId = query.message.chat.id;
-    const data = query.data;
-
-    bot.answerCallbackQuery(query.id).catch(() => {});
-
-    // ── MENÚ PRINCIPAL ──
-    if (data === "menu_main") {
-        const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
-        send(chatId,
-            `🤖 *Bot Validador DIGI v9.2*\n` +
-            `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
-            `📱 WhatsApp: ${status}`,
-            mainMenuKeyboard()
-        );
-        return;
-    }
-
-    // ═══════════════════════════════════════
-    //  CANCELAR QR (botón del live message)
-    // ═══════════════════════════════════════
-    if (data === "cmd_cancelar_qr") {
-        console.log("[WA] Usuario canceló el QR");
-        const savedMsgId = qrMessageId;
-        destroySocket();
-
-        if (savedMsgId) {
-            editQrCaption(chatId, savedMsgId,
-                "❌ *Conexión cancelada*\n\n" +
-                "Pulsa 📱 *Conectar* cuando estés listo para escanear.",
-                mainMenuKeyboard().reply_markup
-            );
-        } else {
-            send(chatId, "❌ *Conexión cancelada*", mainMenuKeyboard());
-        }
-        return;
-    }
-
-    // ═══════════════════════════════════════
-    //  CONECTAR — Live message flow
-    // ═══════════════════════════════════════
-    if (data === "cmd_conectar") {
-        if (isConnected && sock) {
-            const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
-            send(chatId,
-                `✅ *Ya estás conectado*\n\n📱 Número: +${phone}\n🟢 Estado: Activo\n\n` +
-                `Usa 🔌 Desconectar si quieres cambiar de cuenta.`,
-                mainMenuKeyboard()
-            );
-            return;
-        }
-        if (isConnecting) {
-            send(chatId, "⏳ *Ya se está conectando...*\nEspera a que aparezca el QR.");
-            return;
-        }
-
-        // Enviar mensaje "Conectando..." y guardar su ID para borrarlo cuando llegue el QR
-        const initMsg = await send(chatId, "📱 *Conectando WhatsApp...*\n\n⏳ Generando QR, espera unos segundos...");
-        connectingMessageId = initMsg?.message_id || null;
-
-        connectWhatsApp(chatId).catch((e) => {
-            console.error("[WA] Error en connectWhatsApp:", e.message);
-            isConnecting = false;
-            // Borrar "Conectando..." si existe
-            if (connectingMessageId) {
-                bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-                connectingMessageId = null;
-            }
-            send(chatId, `❌ Error conectando: \`${e.message}\`\n\nIntenta de nuevo.`, mainMenuKeyboard());
-        });
-        return;
-    }
-
-    // ── MENÚ SELECCIONAR CANTIDAD ──
-    if (data === "menu_validar") {
-        if (!isConnected) {
-            send(chatId, "❌ *WhatsApp no conectado*\n\nConecta primero:", mainMenuKeyboard());
-            return;
-        }
-        if (validation.active) {
-            send(chatId, "⚠️ Ya hay una validación en curso.", validatingKeyboard());
-            return;
-        }
-        send(chatId,
-            "🎯 *¿Cuántos números válidos quieres encontrar?*\n\n" +
-            "Elige una cantidad o escribe una personalizada:",
-            cantidadKeyboard()
-        );
-        return;
-    }
-
-    // ── CANTIDAD FIJA ──
-    if (data.startsWith("cant_") && data !== "cant_custom") {
-        const cantidad = parseInt(data.replace("cant_", ""));
-        if (isNaN(cantidad) || cantidad < 1) {
-            send(chatId, "❌ Cantidad no válida.", cantidadKeyboard());
-            return;
-        }
-        send(chatId,
-            `📋 *${cantidad.toLocaleString()} números* — Elige el modo:\n\n` +
-            `👥 *Leads*: Guarda todos los válidos\n\n` +
-            `⭐ *Leads Dedicados*: Solo guarda los que tienen nombre real en WhatsApp`,
-            modeKeyboard(cantidad)
-        );
-        return;
-    }
-
-    // ── CANTIDAD PERSONALIZADA ──
-    if (data === "cant_custom") {
-        const prevTimeout = waitingCustomAmount.get(chatId);
-        if (prevTimeout) clearTimeout(prevTimeout);
-
-        const timeout = setTimeout(() => {
-            if (waitingCustomAmount.has(chatId)) {
-                waitingCustomAmount.delete(chatId);
-                send(chatId, "⏰ Tiempo agotado para introducir cantidad.", mainMenuKeyboard());
-            }
-        }, 60000);
-
-        waitingCustomAmount.set(chatId, timeout);
-        send(chatId,
-            "✏️ *Escribe la cantidad de números* que quieres encontrar:\n\n" +
-            "_Ejemplo: 500, 3000, 15000..._\n" +
-            "_Mínimo: 1 | Máximo: 100.000_"
-        );
-        return;
-    }
-
-    // ── MODO SELECCIONADO → FILTRO ──
-    if (data.startsWith("mode_leads_") || data.startsWith("mode_dedicados_")) {
-        const parts = data.split("_");
-        const mode = parts[1];
-        const cantidad = parseInt(parts[2]);
-        if (isNaN(cantidad) || cantidad < 1) {
-            send(chatId, "❌ Error en la cantidad. Vuelve a empezar.", mainMenuKeyboard());
-            return;
-        }
-        send(chatId,
-            `📡 *Filtro de operador*\n\n` +
-            `🎯 *Solo prefijos DIGI*: Busca en rangos 641-645\n\n` +
-            `🌐 *Todos los prefijos*: Busca en todos los móviles españoles`,
-            filterKeyboard(cantidad, mode)
-        );
-        return;
-    }
-
-    // ── FILTRO SELECCIONADO → INICIAR ──
-    if (data.startsWith("filter_")) {
-        const parts = data.split("_");
-        const filter = parts[1];
-        const mode = parts[2];
-        const cantidad = parseInt(parts[3]);
-
-        if (!["digi", "todos"].includes(filter) || !["leads", "dedicados"].includes(mode)) {
-            send(chatId, "❌ Parámetros no válidos. Vuelve a empezar.", mainMenuKeyboard());
-            return;
-        }
-        if (isNaN(cantidad) || cantidad < 1) {
-            send(chatId, "❌ Cantidad no válida. Vuelve a empezar.", mainMenuKeyboard());
-            return;
-        }
-
-        startValidation(chatId, cantidad, mode, filter);
-        return;
-    }
-
-    // ── ESTADO ──
-    if (data === "cmd_estado") {
-        sendEstado(chatId);
-        return;
-    }
-
-    // ── PARAR ──
-    if (data === "cmd_parar") {
-        if (!validation.active) {
-            send(chatId, "ℹ️ No hay validación en curso.", mainMenuKeyboard());
-            return;
-        }
-        validation.stopRequested = true;
-        send(chatId, "⛔ *Deteniendo...*\nRecibirás el resumen en un momento.");
-        return;
-    }
-
-    // ── DESCARGAR ──
-    if (data === "cmd_descargar") {
-        sendDescargar(chatId);
-        return;
-    }
-
-    // ── DESCONECTAR ──
-    if (data === "cmd_desconectar") {
-        if (!sock && !isConnecting) {
-            send(chatId, "ℹ️ No hay sesión activa.", mainMenuKeyboard());
-            return;
-        }
-        if (validation.active) {
-            send(chatId, "⚠️ Hay una validación en curso. Párala primero.", validatingKeyboard());
-            return;
-        }
-        try {
-            if (sock) await sock.logout();
-        } catch (e) {
-            console.error("[WA] Error al cerrar sesión:", e.message);
-        }
-        destroySocket();
-        try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
-        send(chatId, "🔴 *Sesión de WhatsApp cerrada*\n\nCredenciales eliminadas.", mainMenuKeyboard());
-        return;
-    }
-});
-
-// ================================================================
-//  FUNCIONES COMPARTIDAS
-// ================================================================
-
-function sendEstado(chatId) {
-    if (!validation.active && validation.scanned === 0) {
-        const waStatus = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
-        send(chatId, `💤 Sin validación activa.\n\n📱 WhatsApp: ${waStatus}`, mainMenuKeyboard());
-        return;
-    }
-
-    const elapsed = validation.startTime ? Date.now() - validation.startTime : 0;
-    const speed = elapsed > 0 ? (validation.scanned / (elapsed / 1000)).toFixed(1) : "0.0";
-    const pct = validation.target > 0 ? (validation.valid / validation.target) * 100 : 0;
-    const rate = validation.scanned > 0
-        ? ((validation.valid / validation.scanned) * 100).toFixed(1)
-        : "0.0";
-
-    let etaStr = "calculando...";
-    if (validation.valid > 0 && elapsed > 0) {
-        const eta = ((validation.target - validation.valid) / validation.valid) * elapsed;
-        etaStr = formatTime(eta);
-    }
-
+// ── ESTADO ──
+function sendStatus(chat) {
+    if (!val.on && !val.scanned) { send(chat, `💤 Sin validación.\n📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}`, kb.main()); return; }
+    const el = val.start ? Date.now() - val.start : 0;
+    const pct = val.target ? (val.valid / val.target) * 100 : 0;
+    const spd = el > 0 ? (val.scanned / (el / 1000)).toFixed(1) : "0";
     const bars = Math.floor(Math.min(pct, 100) / 5);
     const bar = "█".repeat(bars) + "░".repeat(20 - bars);
-    const statusStr = validation.active ? "🟢 En curso" : "🔴 Detenido";
-    const waStatus = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
-    const modeStr = validation.mode === "dedicados" ? "⭐ Dedicados" : "👥 Leads";
-    const filterStr = validation.filter === "digi" ? "🎯 DIGI" : "🌐 Todos";
-
-    let errLine = "";
-    if (validation.errors > 0) {
-        errLine = `❌ Errores: ${validation.errors.toLocaleString()}\n`;
-        if (validation.lastError) errLine += `📌 Último: \`${validation.lastError.slice(0, 60)}\`\n`;
-    }
-
-    let skipLine = "";
-    if (validation.mode === "dedicados" && validation.skippedNoName > 0) {
-        skipLine = `⏭️ Descartados sin nombre: ${validation.skippedNoName.toLocaleString()}\n`;
-    }
-
-    const kb = validation.active ? validatingKeyboard() : postValidationKeyboard();
-
-    send(chatId,
-        `📊 *Estado de validación*\n\n` +
-        `${statusStr} | WhatsApp: ${waStatus}\n` +
-        `🏷️ Modo: ${modeStr} | Filtro: ${filterStr}\n` +
+    let eta = "—"; if (val.valid > 0 && el > 0) eta = fmtTime(((val.target - val.valid) / val.valid) * el);
+    send(chat,
+        `📊 *Estado DIGI*\n\n${val.on ? "🟢 Activa" : "🔴 Parada"} | 📱 ${connected ? "🟢" : "🔴"}\n` +
         `\`${bar}\` ${pct.toFixed(1)}%\n\n` +
-        `✅ Válidos: *${validation.valid.toLocaleString()}* / ${validation.target.toLocaleString()}\n` +
-        `🔍 Escaneados: ${validation.scanned.toLocaleString()}\n` +
-        `${skipLine}` +
-        `${errLine}` +
-        `⚡ Velocidad: ${speed} núm/s\n` +
-        `📈 Tasa: ${rate}%\n` +
-        `⏱️ Tiempo: ${formatTime(elapsed)}\n` +
-        `🏁 ETA: ${etaStr}`,
-        kb
+        `✅ ${val.valid.toLocaleString()} / ${val.target.toLocaleString()}\n🔍 ${val.scanned.toLocaleString()}` +
+        (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
+        (val.err ? `\n❌ ${val.err.toLocaleString()} errores` : "") +
+        `\n⚡ ${spd}/s | ⏱️ ${fmtTime(el)} | ETA: ${eta}`,
+        val.on ? kb.running() : kb.done()
     );
 }
 
-async function sendDescargar(chatId) {
-    if (!fs.existsSync(ARCHIVO_RESULTADOS)) {
-        send(chatId, "❌ No hay resultados. Inicia una validación primero.", mainMenuKeyboard());
-        return;
-    }
+async function sendCSV(chat) {
+    if (!fs.existsSync(CSV)) { send(chat, "❌ Sin resultados aún.", kb.main()); return; }
     try {
-        const content = fs.readFileSync(ARCHIVO_RESULTADOS, "utf-8");
-        const lines = content.split("\n").filter((l) => l.trim()).length - 1;
-        if (lines <= 0) {
-            send(chatId, "📭 Archivo vacío todavía.", mainMenuKeyboard());
-            return;
-        }
-        await bot.sendDocument(chatId, ARCHIVO_RESULTADOS, {
-            caption: `📋 *${lines.toLocaleString()} números con WhatsApp* ✅`,
-            parse_mode: "Markdown",
-        });
-    } catch (e) {
-        send(chatId, `❌ Error: \`${e.message}\``, mainMenuKeyboard());
-    }
+        const n = fs.readFileSync(CSV, "utf-8").split("\n").filter(l => l.trim()).length - 1;
+        if (n <= 0) { send(chat, "📭 Vacío.", kb.main()); return; }
+        await bot.sendDocument(chat, CSV, { caption: `📋 *${n.toLocaleString()} números DIGI* ✅`, parse_mode: "Markdown" });
+    } catch (e) { send(chat, `❌ \`${e.message}\``, kb.main()); }
 }
 
-// ================================================================
-//  COMANDOS TEXTO (compatibilidad)
-// ================================================================
+// ── CALLBACKS ──
+bot.on("callback_query", async q => {
+    const chat = q.message.chat.id, d = q.data;
+    bot.answerCallbackQuery(q.id).catch(() => {});
 
-bot.onText(/\/start/, (msg) => {
-    console.log(`[CMD] /start recibido de chat ${msg.chat.id}`);
-    const status = isConnected ? "🟢 Conectado" : "🔴 Desconectado";
-    send(msg.chat.id,
-        `🤖 *Bot Validador DIGI v9.2*\n` +
-        `_Powered by Baileys — 100% Gratis 🆓_\n\n` +
-        `📱 WhatsApp: ${status}\n\n` +
-        `Usa los botones o escribe comandos:`,
-        mainMenuKeyboard()
-    );
-});
+    if (d === "main") { send(chat, `🤖 *Bot DIGI v10*\n📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}`, kb.main()); return; }
 
-bot.onText(/\/conectar/, async (msg) => {
-    const chatId = msg.chat.id;
-    console.log(`[CMD] /conectar recibido de chat ${chatId}`);
-    if (isConnected) {
-        const phone = sock?.user?.id?.split(":")[0] || sock?.user?.id?.split("@")[0] || "?";
-        send(chatId, `✅ *Ya estás conectado*\n📱 +${phone}`, mainMenuKeyboard());
+    if (d === "cancel_qr") { const m = qrMsgId; destroy(); if (m) editCaption(chat, m, "❌ *Cancelado*\nPulsa 📱 Conectar.", kb.main().reply_markup); else send(chat, "❌ *Cancelado*", kb.main()); return; }
+
+    if (d === "connect") {
+        if (connected) { send(chat, `✅ *Ya conectado* (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
+        if (connecting) { send(chat, "⏳ *Conectando...*"); return; }
+        const m = await send(chat, "📱 *Conectando...*\n⏳ Generando QR...");
+        connMsgId = m?.message_id || null;
+        connectWA(chat).catch(e => { connecting = false; if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; } send(chat, `❌ \`${e.message}\``, kb.main()); });
         return;
     }
-    if (isConnecting) {
-        send(chatId, "⏳ *Ya se está conectando...*\nEspera a que aparezca el QR.");
-        return;
-    }
-    const initMsg = await send(chatId, "📱 *Conectando WhatsApp...*\n⏳ Generando QR...");
-    connectingMessageId = initMsg?.message_id || null;
 
-    connectWhatsApp(chatId).catch((e) => {
-        isConnecting = false;
-        if (connectingMessageId) {
-            bot.deleteMessage(chatId, connectingMessageId).catch(() => {});
-            connectingMessageId = null;
-        }
-        send(chatId, `❌ Error: \`${e.message}\``, mainMenuKeyboard());
-    });
-});
+    if (d === "validate") {
+        if (!connected) { send(chat, "❌ Conecta WhatsApp primero.", kb.main()); return; }
+        if (val.on) { send(chat, "⚠️ Validación en curso.", kb.running()); return; }
+        send(chat, "🎯 *¿Cuántos números DIGI?*", kb.amount()); return;
+    }
 
-bot.onText(/\/validar(?:\s+(\d+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
-    if (!isConnected) {
-        send(chatId, "❌ *WhatsApp no conectado*\nUsa /conectar primero.", mainMenuKeyboard());
-        return;
+    if (d.startsWith("n_") && d !== "n_custom") {
+        const n = parseInt(d.slice(2));
+        send(chat, `*${n.toLocaleString()} números DIGI* — Elige modo:\n\n👥 *Leads*: Todos los válidos\n⭐ *Dedicados*: Solo con nombre`, kb.mode(n)); return;
     }
-    if (validation.active) {
-        send(chatId, "⚠️ Ya hay validación en curso.", validatingKeyboard());
-        return;
+
+    if (d === "n_custom") {
+        const prev = waitAmt.get(chat); if (prev) clearTimeout(prev);
+        waitAmt.set(chat, setTimeout(() => { waitAmt.delete(chat); send(chat, "⏰ Tiempo agotado.", kb.main()); }, 60000));
+        send(chat, "✏️ Escribe la cantidad (1 - 100.000):"); return;
     }
-    const target = match?.[1] ? Math.max(1, Math.min(100000, parseInt(match[1]))) : null;
-    if (target) {
-        send(chatId,
-            `📋 *${target.toLocaleString()} números* — Elige el modo:`,
-            modeKeyboard(target)
-        );
-    } else {
-        send(chatId, "🎯 *¿Cuántos números válidos quieres?*", cantidadKeyboard());
+
+    if (d.startsWith("go_")) {
+        const [, mode, n] = d.split("_").reduce((a, v, i) => { if (i === 1) a[1] = v; if (i === 2) a[2] = parseInt(v); return a; }, [null, "", 0]);
+        // Parse more carefully
+        const parts = d.split("_");
+        const goMode = parts[1]; // "leads" or "dedicados"
+        const goN = parseInt(parts[2]);
+        if (!goN || !["leads", "dedicados"].includes(goMode)) { send(chat, "❌ Error. Reinicia.", kb.main()); return; }
+        startVal(chat, goN, goMode); return;
+    }
+
+    if (d === "status") { sendStatus(chat); return; }
+    if (d === "stop") { if (!val.on) { send(chat, "ℹ️ Sin validación.", kb.main()); return; } val.stop = true; send(chat, "⛔ *Deteniendo...*"); return; }
+    if (d === "download") { sendCSV(chat); return; }
+
+    if (d === "disconnect") {
+        if (!sock && !connecting) { send(chat, "ℹ️ Sin sesión.", kb.main()); return; }
+        if (val.on) { send(chat, "⚠️ Para la validación primero.", kb.running()); return; }
+        try { if (sock) await sock.logout(); } catch (_) {}
+        destroy();
+        try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+        send(chat, "🔴 *Sesión cerrada.*", kb.main()); return;
     }
 });
 
-bot.onText(/\/estado/, (msg) => sendEstado(msg.chat.id));
+// ── COMANDOS TEXTO ──
+bot.onText(/\/start/, m => send(m.chat.id,
+    `🤖 *Bot DIGI v10*\n_Prefijos CNMC verificados 🟢_\n\n` +
+    `📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}\n\n` +
+    `Prefijos: 614, 624, 641, 642, 643\n+ parciales: 6048-49, 7420, 7430, 7450`,
+    kb.main()
+));
 
-bot.onText(/\/parar/, (msg) => {
-    if (!validation.active) {
-        send(msg.chat.id, "ℹ️ No hay validación en curso.", mainMenuKeyboard());
-        return;
-    }
-    validation.stopRequested = true;
-    send(msg.chat.id, "⛔ *Deteniendo...*\nRecibirás el resumen en un momento.");
+bot.onText(/\/conectar/, async m => {
+    const c = m.chat.id;
+    if (connected) { send(c, `✅ Ya conectado (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
+    if (connecting) { send(c, "⏳ Conectando..."); return; }
+    const msg = await send(c, "📱 Conectando...");
+    connMsgId = msg?.message_id || null;
+    connectWA(c).catch(e => { connecting = false; send(c, `❌ \`${e.message}\``, kb.main()); });
 });
 
-bot.onText(/\/descargar/, (msg) => sendDescargar(msg.chat.id));
-
-bot.onText(/\/desconectar/, async (msg) => {
-    const chatId = msg.chat.id;
-    if (!sock && !isConnecting) {
-        send(chatId, "ℹ️ No hay sesión activa.", mainMenuKeyboard());
-        return;
-    }
-    if (validation.active) {
-        send(chatId, "⚠️ Para primero la validación.", validatingKeyboard());
-        return;
-    }
-    try {
-        if (sock) await sock.logout();
-    } catch (e) {
-        console.error("[WA] Error logout:", e.message);
-    }
-    destroySocket();
-    try { fs.rmSync(AUTH_DIR, { recursive: true, force: true }); } catch (_) {}
-    send(chatId, "🔴 *Sesión cerrada*\nCredenciales eliminadas.", mainMenuKeyboard());
+bot.onText(/\/validar(?:\s+(\d+))?/, (m, match) => {
+    const c = m.chat.id;
+    if (!connected) { send(c, "❌ Conecta primero.", kb.main()); return; }
+    if (val.on) { send(c, "⚠️ En curso.", kb.running()); return; }
+    const n = match?.[1] ? Math.max(1, Math.min(100000, parseInt(match[1]))) : null;
+    if (n) send(c, `*${n.toLocaleString()} DIGI* — Modo:`, kb.mode(n));
+    else send(c, "🎯 *¿Cuántos?*", kb.amount());
 });
 
-// ── CAPTURAR MENSAJES para cantidad personalizada ──
-bot.on("message", (msg) => {
-    const chatId = msg.chat.id;
-    if (!waitingCustomAmount.has(chatId)) return;
-    if (msg.text?.startsWith("/")) return;
-
-    const num = parseInt(msg.text);
-    if (isNaN(num) || num < 1) {
-        send(chatId, "❌ Escribe un número válido. Ejemplo: `5000`");
-        return;
-    }
-
-    const cantidad = Math.min(100000, num);
-
-    const timeout = waitingCustomAmount.get(chatId);
-    if (timeout) clearTimeout(timeout);
-    waitingCustomAmount.delete(chatId);
-
-    send(chatId,
-        `📋 *${cantidad.toLocaleString()} números* — Elige el modo:`,
-        modeKeyboard(cantidad)
-    );
+bot.onText(/\/estado/, m => sendStatus(m.chat.id));
+bot.onText(/\/parar/, m => { if (!val.on) { send(m.chat.id, "ℹ️ Nada activo.", kb.main()); return; } val.stop = true; send(m.chat.id, "⛔ Deteniendo..."); });
+bot.onText(/\/descargar/, m => sendCSV(m.chat.id));
+bot.onText(/\/desconectar/, async m => {
+    const c = m.chat.id;
+    if (!sock && !connecting) { send(c, "ℹ️ Sin sesión.", kb.main()); return; }
+    if (val.on) { send(c, "⚠️ Para primero.", kb.running()); return; }
+    try { if (sock) await sock.logout(); } catch (_) {} destroy();
+    try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+    send(c, "🔴 *Sesión cerrada.*", kb.main());
 });
 
-// ================================================================
-//  APAGADO LIMPIO
-// ================================================================
+// ── CANTIDAD PERSONALIZADA ──
+bot.on("message", m => {
+    const c = m.chat.id;
+    if (!waitAmt.has(c) || m.text?.startsWith("/")) return;
+    const n = parseInt(m.text);
+    if (isNaN(n) || n < 1) { send(c, "❌ Número no válido."); return; }
+    const amt = Math.min(100000, n);
+    clearTimeout(waitAmt.get(c)); waitAmt.delete(c);
+    send(c, `*${amt.toLocaleString()} DIGI* — Modo:`, kb.mode(amt));
+});
 
-function gracefulShutdown(signal) {
-    console.log(`\n[BOT] Señal ${signal} recibida. Cerrando limpiamente...`);
-
-    if (validation.active) {
-        validation.stopRequested = true;
-    }
-
-    destroySocket();
-
-    try {
-        bot.stopPolling();
-    } catch (_) {}
-
-    console.log("[BOT] ✅ Bot cerrado limpiamente.");
+// ── SHUTDOWN ──
+function shutdown(sig) {
+    console.log(`[${sig}] Cerrando...`);
+    if (val.on) val.stop = true;
+    destroy();
+    try { bot.stopPolling(); } catch (_) {}
     process.exit(0);
 }
+process.on("SIGINT", () => shutdown("SIGINT"));
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("uncaughtException", e => console.error("[FATAL]", e.message));
+process.on("unhandledRejection", r => console.error("[FATAL]", r));
 
-process.on("SIGINT", () => gracefulShutdown("SIGINT"));
-process.on("SIGTERM", () => gracefulShutdown("SIGTERM"));
-
-// 🛡️ Capturar errores no manejados
-process.on("uncaughtException", (err) => {
-    console.error("[FATAL] Excepción no capturada:", err.message);
-    console.error(err.stack);
-});
-
-process.on("unhandledRejection", (reason) => {
-    console.error("[FATAL] Promesa rechazada no capturada:", reason);
-});
-
-// ================================================================
-//  MAIN — ⚡ Arranque rápido (NO bloquea Telegram)
-// ================================================================
-
+// ── MAIN ──
 async function main() {
-    console.log("╔══════════════════════════════════════════════════════════╗");
-    console.log("║   BOT VALIDADOR DIGI v9.2 — 1 QR Live Message          ║");
-    console.log("║   100% Gratis • Sin límites • Sin GreenAPI              ║");
-    console.log("╚══════════════════════════════════════════════════════════╝");
-    console.log();
-    console.log(`  Prefijos DIGI: ${PREFIJOS_DIGI.join(", ")}`);
-    console.log(`  Prefijos totales: ${PREFIJOS_TODOS.length}`);
-    console.log(`  Batch: ${BATCH_SIZE} | Delay: ${DELAY_ENTRE_LOTES_MS}ms`);
-    console.log(`  QR timeout: ${QR_TIMEOUT_MS / 1000}s | Reconexiones: ${MAX_RECONNECT_INTENTOS}`);
-    console.log();
-
-    // ⚡ Telegram ya está activo (polling: true arriba)
-    console.log("[BOT] ✅ Telegram activo — /start ya funciona");
-
-    // Intentar reconectar WhatsApp EN BACKGROUND (no bloqueante)
-    const hasSession = fs.existsSync(AUTH_DIR) &&
-                       (() => { try { return fs.readdirSync(AUTH_DIR).length > 0; } catch(_) { return false; } })();
-
-    if (hasSession) {
-        console.log("[WA] Sesión previa encontrada. Reconectando en background...");
-        // 🔥 NO usamos await — se ejecuta en background
-        connectWhatsApp(null).catch((e) => {
-            console.error("[WA] Error reconectando:", e.message);
-            isConnecting = false;
-        });
-    } else {
-        console.log("[WA] No hay sesión. Esperando /conectar...");
-    }
-
-    console.log("[BOT] ✅ Bot listo. Esperando comandos...");
+    console.log("═══ Bot DIGI v10 — Solo DIGI (CNMC) ═══");
+    console.log(`Prefijos: ${PREFIJOS.map(p => p.slice(2)).join(", ")}`);
+    const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
+    if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
+    else console.log("Sin sesión. Esperando /conectar...");
+    console.log("✅ Listo");
 }
-
-main().catch((e) => {
-    console.error("[MAIN] Error fatal al arrancar:", e);
-});
+main().catch(e => console.error("[MAIN]", e));
