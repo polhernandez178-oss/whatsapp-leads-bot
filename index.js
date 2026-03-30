@@ -180,12 +180,16 @@ async function connectWA(chat) {
         }
 
         if (connection === "close") {
-            const was = connected; connected = false; connecting = false;
+            const was = connected;
+            connected = false; connecting = false;
             clearTimeout(qrTimer); qrTimer = null;
             const code = lastDisconnect?.error?.output?.statusCode;
-            const msg = lastDisconnect?.error?.message || "?";
+            const reason = lastDisconnect?.error?.message || "desconocido";
             const savedQr = qrMsgId; qrMsgId = null; qrStart = null;
 
+            console.log(`[WA] Close → code=${code} reason=${reason} wasConnected=${was}`);
+
+            // ── CASO 1: Sesión cerrada desde WhatsApp (loggedOut) ──
             if (code === DisconnectReason.loggedOut) {
                 try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
                 sock = null;
@@ -195,22 +199,41 @@ async function connectWA(chat) {
                 return;
             }
 
-            if (savedQr && !was && chat) {
-                editCaption(chat, savedQr, "❌ *No se pudo vincular*\nPulsa 📱 Conectar.", kb.main().reply_markup);
-                sock = null; return;
+            // ── Verificar si hay credenciales guardadas ──
+            const hasCreds = fs.existsSync(AUTH) && (() => {
+                try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; }
+            })();
+
+            // ── CASO 2: Sin credenciales = nunca se vinculó ──
+            if (!hasCreds) {
+                sock = null;
+                const t = "🔴 *Sin sesión guardada.*\nPulsa 📱 Conectar.";
+                if (chat && savedQr) editCaption(chat, savedQr, t, kb.main().reply_markup);
+                else if (chat) send(chat, t, kb.main());
+                return;
             }
 
-            const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
-            if (!has) { sock = null; if (chat) send(chat, "🔴 Sin sesión. Usa 📱 Conectar.", kb.main()); return; }
-
+            // ── CASO 3: Hay credenciales → SIEMPRE reconectar ──
+            // Esto incluye el ciclo normal post-QR (scan → close → reopen)
             reconnN++;
-            if (reconnN > MAX_RECONN) { destroy(); if (chat) send(chat, `⚠️ *No reconectó tras ${MAX_RECONN} intentos.*\nPulsa 📱 Conectar.`, kb.main()); return; }
+            if (reconnN > MAX_RECONN) {
+                destroy();
+                if (chat) send(chat, `⚠️ *No reconectó tras ${MAX_RECONN} intentos.*\nPulsa 📱 Conectar.`, kb.main());
+                return;
+            }
 
-            const d = Math.min(5000 * Math.pow(1.5, reconnN - 1), 60000);
-            if (was && chat) send(chat, `⚠️ Reconectando en ${Math.round(d/1000)}s... (${reconnN}/${MAX_RECONN})`);
+            // Post-QR: reconectar rápido (2s). Ya conectado: backoff exponencial.
+            const delay = !was ? 2000 : Math.min(5000 * Math.pow(1.5, reconnN - 1), 60000);
+
+            if (!was && savedQr && chat) {
+                editCaption(chat, savedQr, "🔄 *QR escaneado — Vinculando...*", kb.main().reply_markup);
+            } else if (was && chat) {
+                send(chat, `⚠️ Reconectando en ${Math.round(delay / 1000)}s... (${reconnN}/${MAX_RECONN})`);
+            }
+
             try { sock.ev.removeAllListeners(); } catch (_) {} sock = null;
             clearTimeout(reconnTimer);
-            reconnTimer = setTimeout(() => { connecting = false; connectWA(chat).catch(() => {}); }, d);
+            reconnTimer = setTimeout(() => { connecting = false; connectWA(chat).catch(() => {}); }, delay);
         }
     });
 }
