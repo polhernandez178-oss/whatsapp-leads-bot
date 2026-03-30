@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bot Validador DIGI v10 — Solo DIGI • Prefijos CNMC verificados
+// Bot Validador DIGI v10 — Solo DIGI
 "use strict";
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
@@ -312,7 +312,7 @@ function startVal(chat, target, mode) {
     val.on = true; val.target = target; val.chat = chat; val.mode = mode;
     send(chat,
         `🚀 *Validación DIGI iniciada*\n\n${mode === "dedicados" ? "⭐ Dedicados (solo con nombre)" : "👥 Leads (todos)"}\n` +
-        `🎯 ${target.toLocaleString()} números\n📡 ${PREFIJOS.length} prefijos CNMC`,
+        `🎯 ${target.toLocaleString()} números\n📡 Prefijos DIGI: 614, 624, 641, 642, 643`,
         kb.running()
     );
     runValidation().catch(e => { val.on = false; send(chat, `💥 \`${e.message}\``, kb.done()); });
@@ -408,9 +408,9 @@ bot.on("callback_query", async q => {
 
 // ── COMANDOS TEXTO ──
 bot.onText(/\/start/, m => send(m.chat.id,
-    `🤖 *Bot DIGI v10*\n_Prefijos CNMC verificados 🟢_\n\n` +
+    `🤖 *Bot DIGI v10*\n_Solo DIGI 🟢_\n\n` +
     `📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}\n\n` +
-    `Prefijos: 614, 624, 641, 642, 643\n+ parciales: 6048-49, 7420, 7430, 7450`,
+    `Prefijos: 614, 624, 641, 642, 643`,
     kb.main()
 ));
 
@@ -470,7 +470,7 @@ process.on("unhandledRejection", r => console.error("[FATAL]", r));
 
 // ── MAIN ──
 async function main() {
-    console.log("═══ Bot DIGI v10 — Solo DIGI (CNMC) ═══");
+    console.log("═══ Bot DIGI v10 — Solo DIGI ═══");
     console.log(`Prefijos: ${PREFIJOS.map(p => p.slice(2)).join(", ")}`);
     const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
     if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
