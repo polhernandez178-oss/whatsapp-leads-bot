@@ -47,6 +47,7 @@ const fmtTime = ms => { if (!ms || ms < 0) return "—"; const s = Math.floor(ms
 const kb = {
     main: () => ({ reply_markup: { inline_keyboard: [
         [{ text: "📱 Conectar WhatsApp", callback_data: "connect" }],
+        [{ text: "🔄 Nueva sesión (otro número)", callback_data: "new_session" }],
         [{ text: "🚀 Validar DIGI", callback_data: "validate" }],
         [{ text: "📊 Estado", callback_data: "status" }, { text: "📥 CSV", callback_data: "download" }],
         [{ text: "🔌 Desconectar", callback_data: "disconnect" }],
@@ -144,7 +145,6 @@ async function connectWA(chat) {
 
         if (qr) {
             qrN++;
-            // Reiniciar timer cada QR nuevo
             qrStart = Date.now();
             clearTimeout(qrTimer);
             qrTimer = setTimeout(() => {
@@ -158,7 +158,6 @@ async function connectWA(chat) {
 
             QRCode.toBuffer(qr, { scale: 8 }).then(async buf => {
                 if (!chat) return;
-                // Borrar mensaje previo (QR anterior o "Conectando...")
                 if (qrMsgId) { bot.deleteMessage(chat, qrMsgId).catch(() => {}); qrMsgId = null; }
                 if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; }
                 const cap = qrN > 1
@@ -199,6 +198,17 @@ async function connectWA(chat) {
                 return;
             }
 
+            // ── CASO 1b: Número bloqueado/baneado (401, 403, 440) ──
+            const BANNED_CODES = [401, 403, 440, 411, 500];
+            if (BANNED_CODES.includes(code)) {
+                try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+                sock = null;
+                const t = "🚫 *Número bloqueado o sesión inválida*\n(código: " + code + ")\n\n📱 Pulsa *Conectar* para vincular otro número.";
+                if (chat && savedQr) editCaption(chat, savedQr, t, kb.main().reply_markup);
+                else if (chat) send(chat, t, kb.main());
+                return;
+            }
+
             // ── Verificar si hay credenciales guardadas ──
             const hasCreds = fs.existsSync(AUTH) && (() => {
                 try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; }
@@ -214,15 +224,14 @@ async function connectWA(chat) {
             }
 
             // ── CASO 3: Hay credenciales → SIEMPRE reconectar ──
-            // Esto incluye el ciclo normal post-QR (scan → close → reopen)
             reconnN++;
             if (reconnN > MAX_RECONN) {
                 destroy();
-                if (chat) send(chat, `⚠️ *No reconectó tras ${MAX_RECONN} intentos.*\nPulsa 📱 Conectar.`, kb.main());
+                try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+                if (chat) send(chat, `⚠️ *No reconectó tras ${MAX_RECONN} intentos.*\n🗑️ Sesión limpiada.\n\n📱 Pulsa *Conectar* para vincular otro número.`, kb.main());
                 return;
             }
 
-            // Post-QR: reconectar rápido (2s). Ya conectado: backoff exponencial.
             const delay = !was ? 2000 : Math.min(5000 * Math.pow(1.5, reconnN - 1), 60000);
 
             if (!was && savedQr && chat) {
@@ -389,9 +398,26 @@ bot.on("callback_query", async q => {
     if (d === "connect") {
         if (connected) { send(chat, `✅ *Ya conectado* (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
         if (connecting) { send(chat, "⏳ *Conectando...*"); return; }
+        // Si ya falló antes (reconnN agotado), limpiar sesión automáticamente
+        if (reconnN >= MAX_RECONN) {
+            try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+            reconnN = 0;
+        }
         const m = await send(chat, "📱 *Conectando...*\n⏳ Generando QR...");
         connMsgId = m?.message_id || null;
         connectWA(chat).catch(e => { connecting = false; if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; } send(chat, `❌ \`${e.message}\``, kb.main()); });
+        return;
+    }
+
+    if (d === "new_session") {
+        if (val.on) { send(chat, "⚠️ Para la validación primero.", kb.running()); return; }
+        destroy();
+        try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+        reconnN = 0;
+        send(chat, "🗑️ *Sesión anterior eliminada.*\n\n📱 Generando QR nuevo...");
+        const m = await send(chat, "📱 *Conectando...*\n⏳ Generando QR...");
+        connMsgId = m?.message_id || null;
+        connectWA(chat).catch(e => { connecting = false; send(chat, `❌ \`${e.message}\``, kb.main()); });
         return;
     }
 
@@ -413,10 +439,8 @@ bot.on("callback_query", async q => {
     }
 
     if (d.startsWith("go_")) {
-        const [, mode, n] = d.split("_").reduce((a, v, i) => { if (i === 1) a[1] = v; if (i === 2) a[2] = parseInt(v); return a; }, [null, "", 0]);
-        // Parse more carefully
         const parts = d.split("_");
-        const goMode = parts[1]; // "leads" or "dedicados"
+        const goMode = parts[1];
         const goN = parseInt(parts[2]);
         if (!goN || !["leads", "dedicados"].includes(goMode)) { send(chat, "❌ Error. Reinicia.", kb.main()); return; }
         startVal(chat, goN, goMode); return;
@@ -448,6 +472,11 @@ bot.onText(/\/conectar/, async m => {
     const c = m.chat.id;
     if (connected) { send(c, `✅ Ya conectado (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
     if (connecting) { send(c, "⏳ Conectando..."); return; }
+    // Limpiar sesión fallida
+    if (reconnN >= MAX_RECONN) {
+        try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+        reconnN = 0;
+    }
     const msg = await send(c, "📱 Conectando...");
     connMsgId = msg?.message_id || null;
     connectWA(c).catch(e => { connecting = false; send(c, `❌ \`${e.message}\``, kb.main()); });
