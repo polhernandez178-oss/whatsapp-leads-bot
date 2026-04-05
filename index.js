@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bot Validador DIGI v11 — Anti-Ban / 10K+
+// Bot Validador DIGI v12 — Anti-Ban / Continuo / 1800/h
 "use strict";
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
@@ -7,32 +7,30 @@ const TelegramBot = require("node-telegram-bot-api");
 const QRCode = require("qrcode");
 const pino = require("pino");
 const fs = require("fs");
+const path = require("path");
 
 // ── CONFIG ──
 const TOKEN = "8710402523:AAHzR-ZQ8XR_qSJSOzJ6VPFIZYD1HnLoJtA";
 const AUTH = "./auth_session";
-const CSV = "numeros_validados.csv";
-const TXT = "numeros_validados.txt";
+const LISTS_DIR = "./listas";  // carpeta donde se guardan las listas
 
 // ── ANTI-BAN: parámetros clave ──
-const BATCH        = 8;          // lote medio (era 20) — buen balance
-const DELAY_MIN    = 2500;       // mínimo 2.5 s entre lotes
-const DELAY_MAX    = 6000;       // máximo 6 s entre lotes (jitter real)
+const BATCH        = 8;
+const DELAY_MIN    = 2500;
+const DELAY_MAX    = 6000;
 const NOTIFY       = 50;
 const MAX_ERR      = 10;
 const QR_MS        = 60000;
 const MAX_RECONN   = 5;
 
-// Pausas largas periódicas (anti-ban)
-const REST_EVERY   = 100;        // cada 100 lotes (~800 checks) → pausa larga
-const REST_MS_MIN  = 90000;      // 1.5 min mínimo
-const REST_MS_MAX  = 210000;     // 3.5 min máximo
+const REST_EVERY   = 100;
+const REST_MS_MIN  = 90000;
+const REST_MS_MAX  = 210000;
 
-// Límite horario de seguridad
-const MAX_PER_HOUR = 3000;       // ~3000 checks/hora (seguro con jitter)
+// Límite horario: 1800 checks/hora
+const MAX_PER_HOUR = 1800;
 
-// Pausa extra cuando hay errores consecutivos
-const ERR_PAUSE_MS = 45000;      // 45 s si hay muchos errores seguidos
+const ERR_PAUSE_MS = 45000;
 
 // ── PREFIJOS DIGI ──
 const PREFIJOS = ["34614", "34624", "34641", "34642", "34643"];
@@ -44,16 +42,29 @@ let qrTimer = null, qrMsgId = null, qrStart = null, connMsgId = null;
 let qrN = 0, reconnN = 0, reconnTimer = null, connChat = null;
 
 const val = {
-    on: false, stop: false, target: 0,
+    on: false, stop: false,
     scanned: 0, valid: 0, skip: 0, err: 0, errRow: 0,
     start: null, chat: null, lastN: 0, lastErr: "", mode: "leads",
-    batchCount: 0,              // contador de lotes para pausas periódicas
-    hourStart: null,            // inicio de la ventana horaria actual
-    hourCount: 0                // checks en la hora actual
+    batchCount: 0,
+    hourStart: null,
+    hourCount: 0,
+    currentFile: null   // archivo TXT de la sesión actual
 };
 const checked = new Set();
 const names   = new Map();
-const waitAmt = new Map();
+const waitName = new Map();  // espera nombre de lista tras detener
+const usedNames = new Set(); // nombres de lista ya usados
+
+// Crear carpeta de listas si no existe
+if (!fs.existsSync(LISTS_DIR)) fs.mkdirSync(LISTS_DIR, { recursive: true });
+
+// Cargar nombres de lista ya usados
+try {
+    const files = fs.readdirSync(LISTS_DIR);
+    for (const f of files) {
+        if (f.endsWith(".txt")) usedNames.add(f.replace(/\.txt$/, "").toLowerCase());
+    }
+} catch (_) {}
 
 // ── TELEGRAM ──
 const bot = new TelegramBot(TOKEN, { polling: true });
@@ -65,36 +76,28 @@ const sleep   = ms => new Promise(r => setTimeout(r, ms));
 const timeout = (p, ms, fb = null) => { let t; return Promise.race([p, new Promise(r => { t = setTimeout(() => r(fb), ms); })]).finally(() => clearTimeout(t)); };
 const fmtTime = ms => { if (!ms || ms < 0) return "—"; const s = Math.floor(ms/1000), h = Math.floor(s/3600), m = Math.floor(s%3600/60); return h ? `${h}h ${m}m` : m ? `${m}m ${s%60}s` : `${s%60}s`; };
 
-// Delay aleatorio con jitter humano
 const randDelay = () => DELAY_MIN + Math.floor(Math.random() * (DELAY_MAX - DELAY_MIN));
 const randRest  = () => REST_MS_MIN + Math.floor(Math.random() * (REST_MS_MAX - REST_MS_MIN));
 
 // ── TECLADOS ──
 const kb = {
     main: () => ({ reply_markup: { inline_keyboard: [
-        [{ text: "📱 Conectar WhatsApp", callback_data: "connect" }],
-        [{ text: "🔄 Nueva sesión (otro número)", callback_data: "new_session" }],
+        [{ text: "📱 Conectar WhatsApp", callback_data: "new_session" }],
         [{ text: "🚀 Validar DIGI", callback_data: "validate" }],
-        [{ text: "📊 Estado", callback_data: "status" }, { text: "📥 CSV", callback_data: "download" }, { text: "📄 TXT", callback_data: "download_txt" }],
+        [{ text: "📊 Estado", callback_data: "status" }],
+        [{ text: "📂 Mis listas", callback_data: "my_lists" }],
         [{ text: "🔌 Desconectar", callback_data: "disconnect" }],
     ]}}),
     cancel: () => ({ inline_keyboard: [[{ text: "❌ Cancelar", callback_data: "cancel_qr" }]] }),
-    amount: () => ({ reply_markup: { inline_keyboard: [
-        [{ text: "2.000", callback_data: "n_2000" }, { text: "4.000", callback_data: "n_4000" }],
-        [{ text: "6.000", callback_data: "n_6000" }, { text: "8.000", callback_data: "n_8000" }],
-        [{ text: "🔟 10.000", callback_data: "n_10000" }],
-        [{ text: "✏️ Personalizada", callback_data: "n_custom" }],
+    mode: () => ({ reply_markup: { inline_keyboard: [
+        [{ text: "👥 Leads", callback_data: "go_leads" }],
+        [{ text: "⭐ Dedicados (con nombre)", callback_data: "go_dedicados" }],
         [{ text: "🔙 Menú", callback_data: "main" }],
     ]}}),
-    mode: n => ({ reply_markup: { inline_keyboard: [
-        [{ text: "👥 Leads", callback_data: `go_leads_${n}` }],
-        [{ text: "⭐ Dedicados (con nombre)", callback_data: `go_dedicados_${n}` }],
-        [{ text: "🔙 Cantidad", callback_data: "validate" }],
-    ]}}),
-    running: () => ({ reply_markup: { inline_keyboard: [[{ text: "📊 Estado", callback_data: "status" }, { text: "⛔ PARAR", callback_data: "stop" }]] }}),
+    running: () => ({ reply_markup: { inline_keyboard: [[{ text: "📊 Estado", callback_data: "status" }, { text: "⛔ DETENER", callback_data: "stop" }]] }}),
     done: () => ({ reply_markup: { inline_keyboard: [
-        [{ text: "📥 CSV", callback_data: "download" }, { text: "📄 TXT", callback_data: "download_txt" }],
-        [{ text: "🚀 Nueva", callback_data: "validate" }],
+        [{ text: "🚀 Nueva validación", callback_data: "validate" }],
+        [{ text: "📂 Mis listas", callback_data: "my_lists" }],
         [{ text: "🏠 Menú", callback_data: "main" }],
     ]}}),
 };
@@ -106,41 +109,45 @@ function genNum() {
     return pfx + suf;
 }
 
-// ── CSV ──
-function loadCSV() {
-    // Cargar desde TXT (fuente primaria)
-    if (fs.existsSync(TXT)) {
+// ── GUARDAR NÚMERO EN ARCHIVO TEMPORAL DE SESIÓN ──
+function saveNum(num, name, mode) {
+    if (!val.currentFile) return;
+    try {
+        if (mode === "dedicados" && name && name !== "Sin nombre") {
+            fs.appendFileSync(val.currentFile, `+${num} | ${name}\n`, "utf-8");
+        } else {
+            fs.appendFileSync(val.currentFile, `+${num}\n`, "utf-8");
+        }
+    } catch (_) {}
+}
+
+// ── CARGAR NÚMEROS YA CHEQUEADOS (de todas las listas) ──
+function loadChecked() {
+    checked.clear();
+    try {
+        const files = fs.readdirSync(LISTS_DIR);
+        for (const f of files) {
+            if (!f.endsWith(".txt")) continue;
+            try {
+                const lines = fs.readFileSync(path.join(LISTS_DIR, f), "utf-8").split("\n");
+                for (const l of lines) {
+                    const match = l.trim().match(/^\+?(\d{10,})/);
+                    if (match) checked.add(match[1]);
+                }
+            } catch (_) {}
+        }
+    } catch (_) {}
+    // También cargar del archivo temporal actual
+    if (val.currentFile && fs.existsSync(val.currentFile)) {
         try {
-            const lines = fs.readFileSync(TXT, "utf-8").split("\n");
-            for (const l of lines) { const n = l.trim().replace(/^\+/, ""); if (n && /^\d{10,}$/.test(n)) checked.add(n); }
-        } catch (_) {}
-    }
-    // Cargar desde CSV (retrocompatibilidad)
-    if (fs.existsSync(CSV)) {
-        try {
-            const lines = fs.readFileSync(CSV, "utf-8").split("\n").slice(1);
+            const lines = fs.readFileSync(val.currentFile, "utf-8").split("\n");
             for (const l of lines) {
-                const p = l.split(",");
-                for (const col of p) { const n = col.trim().replace(/"/g, "").replace(/^\+/, ""); if (n && /^\d{10,}$/.test(n)) { checked.add(n); break; } }
+                const match = l.trim().match(/^\+?(\d{10,})/);
+                if (match) checked.add(match[1]);
             }
         } catch (_) {}
     }
-    console.log(`[TXT/CSV] ${checked.size} previos`);
-}
-
-function saveNum(num, name, mode) {
-    // Siempre guardar número con prefijo + en TXT
-    try { fs.appendFileSync(TXT, `+${num}\n`, "utf-8"); } catch (_) {}
-    // CSV: con nombre solo en modo dedicados
-    try {
-        const exists = fs.existsSync(CSV);
-        if (mode === "dedicados") {
-            const n = (name || "Sin nombre").replace(/"/g, '""');
-            fs.appendFileSync(CSV, exists ? `\n"${n}","+${num}"` : `"Nombre","Telefono"\n"${n}","+${num}"`, "utf-8");
-        } else {
-            fs.appendFileSync(CSV, exists ? `\n"+${num}"` : `"Telefono"\n"+${num}"`, "utf-8");
-        }
-    } catch (_) {}
+    console.log(`[LOAD] ${checked.size} números previos cargados`);
 }
 
 // ── WHATSAPP ──
@@ -290,7 +297,7 @@ async function connectWA(chat) {
     });
 }
 
-// ── CHECK NÚMEROS (lote pequeño = menos sospechoso) ──
+// ── CHECK NÚMEROS ──
 async function checkNums(nums) {
     if (!sock || !connected) return nums.map(() => null);
     try {
@@ -312,12 +319,10 @@ async function getName(num) {
 // ── CONTROL DE VELOCIDAD HORARIA ──
 async function rateGuard(checksToAdd) {
     const now = Date.now();
-    // Reiniciar ventana horaria
     if (!val.hourStart || now - val.hourStart >= 3600000) {
         val.hourStart = now;
         val.hourCount = 0;
     }
-    // Si estamos cerca del límite horario, esperar al inicio de la siguiente hora
     if (val.hourCount + checksToAdd > MAX_PER_HOUR) {
         const remaining = 3600000 - (now - val.hourStart);
         const wait = Math.max(remaining, 1000);
@@ -329,19 +334,23 @@ async function rateGuard(checksToAdd) {
     val.hourCount += checksToAdd;
 }
 
-// ── VALIDACIÓN ANTI-BAN ──
+// ── VALIDACIÓN CONTINUA (sin objetivo, corre hasta DETENER) ──
 async function runValidation() {
     val.start = Date.now();
     val.scanned = 0; val.valid = 0; val.skip = 0;
     val.err = 0; val.errRow = 0; val.lastN = 0; val.lastErr = "";
     val.stop = false; val.batchCount = 0;
     val.hourStart = Date.now(); val.hourCount = 0;
-    loadCSV();
+
+    // Crear archivo temporal para esta sesión
+    val.currentFile = path.join(LISTS_DIR, `_temp_session_${Date.now()}.txt`);
+
+    loadChecked();
     let dcWait = 0;
 
     try {
-        while (val.valid < val.target) {
-            if (val.stop) break;
+        // Corre indefinidamente hasta que el usuario pulse DETENER
+        while (!val.stop) {
 
             // ── Reconexión ──
             if (!connected) {
@@ -369,20 +378,21 @@ async function runValidation() {
                 const rate = val.scanned > 0 ? ((val.valid / val.scanned) * 100).toFixed(1) : "0";
                 send(val.chat,
                     `🛡️ *Pausa anti-ban* (lote ${val.batchCount})\n\n` +
-                    `✅ ${val.valid.toLocaleString()} / ${val.target.toLocaleString()}\n` +
+                    `✅ ${val.valid.toLocaleString()} válidos\n` +
                     `⚡ Tasa: ${rate}% | ⏱️ ${fmtTime(el)}\n\n` +
                     `💤 Reanuda en ${fmtTime(restMs)}...`,
                     kb.running()
                 );
                 await sleep(restMs);
                 if (val.stop) break;
-                val.hourStart = Date.now(); // resetear ventana horaria tras pausa larga
+                val.hourStart = Date.now();
                 val.hourCount = 0;
                 if (!connected) continue;
             }
 
             // ── Control de velocidad horaria ──
             await rateGuard(BATCH);
+            if (val.stop) break;
 
             // ── Generar lote sin repetidos ──
             const batch = [];
@@ -399,7 +409,7 @@ async function runValidation() {
             val.batchCount++;
 
             for (let i = 0; i < batch.length; i++) {
-                if (val.stop || val.valid >= val.target) break;
+                if (val.stop) break;
                 if (res[i] === null) { val.err++; val.errRow++; continue; }
                 val.scanned++; val.errRow = 0;
 
@@ -418,42 +428,118 @@ async function runValidation() {
                 const el  = Date.now() - val.start;
                 const spd = (val.scanned / (el / 1000)).toFixed(2);
                 const rate = ((val.valid / val.scanned) * 100).toFixed(1);
-                const eta  = ((val.target - val.valid) / Math.max(val.valid, 1)) * el;
                 send(val.chat,
-                    `🔔 *Progreso DIGI*\n\n✅ ${val.valid.toLocaleString()} / ${val.target.toLocaleString()}\n🔍 ${val.scanned.toLocaleString()} escaneados` +
+                    `🔔 *Progreso DIGI*\n\n✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados` +
                     (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
-                    `\n⚡ ${spd}/s • ${rate}%\n🛡️ ${val.hourCount}/${MAX_PER_HOUR} checks/h\n⏱️ ${fmtTime(el)} | ETA: ${fmtTime(eta)}`,
+                    `\n⚡ ${spd}/s • ${rate}%\n🛡️ ${val.hourCount}/${MAX_PER_HOUR} checks/h\n⏱️ ${fmtTime(el)}`,
                     kb.running()
                 );
                 val.lastN = val.valid;
             }
 
-            // ── Delay aleatorio entre lotes (comportamiento humano) ──
+            // ── Delay aleatorio entre lotes ──
             await sleep(randDelay());
         }
     } catch (e) { send(val.chat, `💥 *Error:* \`${String(e).slice(0, 200)}\``, kb.done()); }
 
     val.on = false;
     const el = Date.now() - val.start;
-    const icon  = val.stop ? "⛔" : val.valid >= val.target ? "🎉" : "⚠️";
-    const title = val.stop ? "Detenida" : val.valid >= val.target ? "¡Completada!" : "Interrumpida";
-    send(val.chat,
-        `${icon} *${title}*\n\n📡 DIGI 🟢 | ${val.mode === "dedicados" ? "⭐ Dedicados" : "👥 Leads"}\n` +
-        `✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados` +
-        (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
-        `\n❌ ${val.err.toLocaleString()} errores\n⏱️ ${fmtTime(el)}`,
-        kb.done()
-    );
+
+    // Pedir nombre para la lista
+    if (val.valid > 0 && val.currentFile && fs.existsSync(val.currentFile)) {
+        send(val.chat,
+            `⛔ *Validación detenida*\n\n📡 DIGI 🟢 | ${val.mode === "dedicados" ? "⭐ Dedicados" : "👥 Leads"}\n` +
+            `✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados` +
+            (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
+            `\n❌ ${val.err.toLocaleString()} errores\n⏱️ ${fmtTime(el)}\n\n` +
+            `📝 *Escribe un nombre para guardar esta lista:*\n_(El nombre no puede repetirse con listas anteriores)_`
+        );
+        // Activar espera de nombre
+        const prev = waitName.get(val.chat); if (prev) clearTimeout(prev);
+        waitName.set(val.chat, setTimeout(() => {
+            // Si no contesta en 2 minutos, guardar con nombre automático
+            const autoName = `lista_${Date.now()}`;
+            finalizarLista(val.chat, autoName);
+        }, 120000));
+    } else {
+        send(val.chat,
+            `⛔ *Validación detenida*\n\n` +
+            `✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados\n⏱️ ${fmtTime(el)}\n\n` +
+            `_No se encontraron números válidos para guardar._`,
+            kb.done()
+        );
+        // Limpiar archivo temporal vacío
+        if (val.currentFile && fs.existsSync(val.currentFile)) {
+            try { fs.unlinkSync(val.currentFile); } catch (_) {}
+        }
+        val.currentFile = null;
+    }
 }
 
-function startVal(chat, target, mode) {
+function finalizarLista(chat, nombre) {
+    clearTimeout(waitName.get(chat));
+    waitName.delete(chat);
+
+    if (!val.currentFile || !fs.existsSync(val.currentFile)) {
+        send(chat, "❌ No hay datos para guardar.", kb.done());
+        val.currentFile = null;
+        return;
+    }
+
+    // Sanitizar nombre
+    const safe = nombre.replace(/[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑ _-]/g, "").trim();
+    if (!safe) {
+        send(chat, "❌ Nombre no válido. Escribe otro:");
+        return;
+    }
+
+    // Verificar que no se repita
+    if (usedNames.has(safe.toLowerCase())) {
+        send(chat, `❌ Ya existe una lista con el nombre *"${safe}"*.\n📝 Escribe otro nombre:`);
+        return;
+    }
+
+    const finalPath = path.join(LISTS_DIR, `${safe}.txt`);
+    try {
+        fs.renameSync(val.currentFile, finalPath);
+    } catch (_) {
+        // Si rename falla (cross-device), copiar
+        try {
+            fs.copyFileSync(val.currentFile, finalPath);
+            fs.unlinkSync(val.currentFile);
+        } catch (e) {
+            send(chat, `❌ Error al guardar: \`${e.message}\``, kb.done());
+            val.currentFile = null;
+            return;
+        }
+    }
+
+    usedNames.add(safe.toLowerCase());
+    val.currentFile = null;
+
+    // Contar líneas
+    let count = 0;
+    try { count = fs.readFileSync(finalPath, "utf-8").split("\n").filter(l => l.trim()).length; } catch (_) {}
+
+    send(chat,
+        `✅ *Lista guardada*\n\n📄 *${safe}.txt*\n📊 ${count.toLocaleString()} números\n📂 Carpeta: \`${LISTS_DIR}/\``,
+        kb.done()
+    );
+
+    // Enviar el archivo
+    try {
+        bot.sendDocument(chat, finalPath, { caption: `📄 *${safe}* — ${count.toLocaleString()} números DIGI ✅`, parse_mode: "Markdown" }).catch(() => {});
+    } catch (_) {}
+}
+
+function startVal(chat, mode) {
     if (!connected) { send(chat, "❌ *WhatsApp no conectado*\nUsa 📱 Conectar.", kb.main()); return; }
     if (val.on) { send(chat, "⚠️ Ya hay validación en curso.", kb.running()); return; }
-    val.on = true; val.target = target; val.chat = chat; val.mode = mode;
+    val.on = true; val.chat = chat; val.mode = mode;
     send(chat,
-        `🚀 *Validación DIGI v11 iniciada*\n\n` +
+        `🚀 *Validación DIGI v12 iniciada*\n\n` +
         `${mode === "dedicados" ? "⭐ Dedicados (solo con nombre)" : "👥 Leads (todos)"}\n` +
-        `🎯 ${target.toLocaleString()} números\n` +
+        `🎯 *Modo continuo* — Corre hasta que pulses DETENER\n` +
         `📡 Prefijos DIGI: 614, 624, 641, 642, 643\n\n` +
         `🛡️ *Modo anti-ban activado*\n` +
         `• Lotes de ${BATCH} números\n` +
@@ -469,39 +555,33 @@ function startVal(chat, target, mode) {
 function sendStatus(chat) {
     if (!val.on && !val.scanned) { send(chat, `💤 Sin validación.\n📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}`, kb.main()); return; }
     const el   = val.start ? Date.now() - val.start : 0;
-    const pct  = val.target ? (val.valid / val.target) * 100 : 0;
     const spd  = el > 0 ? (val.scanned / (el / 1000)).toFixed(2) : "0";
-    const bars = Math.floor(Math.min(pct, 100) / 5);
-    const bar  = "█".repeat(bars) + "░".repeat(20 - bars);
-    let eta = "—"; if (val.valid > 0 && el > 0) eta = fmtTime(((val.target - val.valid) / val.valid) * el);
     send(chat,
-        `📊 *Estado DIGI v11*\n\n${val.on ? "🟢 Activa" : "🔴 Parada"} | 📱 ${connected ? "🟢" : "🔴"}\n` +
-        `\`${bar}\` ${pct.toFixed(1)}%\n\n` +
-        `✅ ${val.valid.toLocaleString()} / ${val.target.toLocaleString()}\n🔍 ${val.scanned.toLocaleString()}` +
+        `📊 *Estado DIGI v12*\n\n${val.on ? "🟢 Activa (continua)" : "🔴 Parada"} | 📱 ${connected ? "🟢" : "🔴"}\n\n` +
+        `✅ ${val.valid.toLocaleString()} válidos\n🔍 ${val.scanned.toLocaleString()} escaneados` +
         (val.skip ? `\n⏭️ ${val.skip.toLocaleString()} sin nombre` : "") +
         (val.err  ? `\n❌ ${val.err.toLocaleString()} errores` : "") +
-        `\n⚡ ${spd}/s | 🛡️ ${val.hourCount}/${MAX_PER_HOUR}/h\n⏱️ ${fmtTime(el)} | ETA: ${eta}`,
+        `\n⚡ ${spd}/s | 🛡️ ${val.hourCount}/${MAX_PER_HOUR}/h\n⏱️ ${fmtTime(el)}`,
         val.on ? kb.running() : kb.done()
     );
 }
 
-async function sendCSV(chat) {
-    if (!fs.existsSync(CSV)) { send(chat, "❌ Sin resultados aún.", kb.main()); return; }
+// ── LISTAR LISTAS GUARDADAS ──
+function sendMyLists(chat) {
     try {
-        const n = fs.readFileSync(CSV, "utf-8").split("\n").filter(l => l.trim()).length - 1;
-        if (n <= 0) { send(chat, "📭 Vacío.", kb.main()); return; }
-        await bot.sendDocument(chat, CSV, { caption: `📋 *${n.toLocaleString()} números DIGI* ✅`, parse_mode: "Markdown" });
-    } catch (e) { send(chat, `❌ \`${e.message}\``, kb.main()); }
-}
-
-async function sendTXT(chat) {
-    if (!fs.existsSync(TXT)) { send(chat, "❌ Sin resultados aún.", kb.main()); return; }
-    try {
-        const lines = fs.readFileSync(TXT, "utf-8").split("\n").filter(l => l.trim());
-        const n = lines.length;
-        if (n <= 0) { send(chat, "📭 Vacío.", kb.main()); return; }
-        await bot.sendDocument(chat, TXT, { caption: `📄 *${n.toLocaleString()} números DIGI* (+34) ✅`, parse_mode: "Markdown" });
-    } catch (e) { send(chat, `❌ \`${e.message}\``, kb.main()); }
+        const files = fs.readdirSync(LISTS_DIR).filter(f => f.endsWith(".txt") && !f.startsWith("_temp_"));
+        if (!files.length) { send(chat, "📂 *No tienes listas guardadas.*", kb.main()); return; }
+        let txt = "📂 *Mis listas:*\n\n";
+        for (const f of files) {
+            let count = 0;
+            try { count = fs.readFileSync(path.join(LISTS_DIR, f), "utf-8").split("\n").filter(l => l.trim()).length; } catch (_) {}
+            txt += `📄 *${f.replace(".txt", "")}* — ${count.toLocaleString()} números\n`;
+        }
+        // Crear botones para descargar cada lista
+        const buttons = files.map(f => [{ text: `📥 ${f.replace(".txt", "")}`, callback_data: `dl_${f.replace(".txt", "").slice(0, 40)}` }]);
+        buttons.push([{ text: "🏠 Menú", callback_data: "main" }]);
+        send(chat, txt, { reply_markup: { inline_keyboard: buttons } });
+    } catch (e) { send(chat, "❌ Error al listar.", kb.main()); }
 }
 
 // ── CALLBACKS ──
@@ -509,7 +589,7 @@ bot.on("callback_query", async q => {
     const chat = q.message.chat.id, d = q.data;
     bot.answerCallbackQuery(q.id).catch(() => {});
 
-    if (d === "main") { send(chat, `🤖 *Bot DIGI v11*\n📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}`, kb.main()); return; }
+    if (d === "main") { send(chat, `🤖 *Bot DIGI v12*\n📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}`, kb.main()); return; }
 
     if (d === "cancel_qr") {
         const m = qrMsgId; destroy();
@@ -517,16 +597,7 @@ bot.on("callback_query", async q => {
         else send(chat, "❌ *Cancelado*", kb.main()); return;
     }
 
-    if (d === "connect") {
-        if (connected) { send(chat, `✅ *Ya conectado* (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
-        if (connecting) { send(chat, "⏳ *Conectando...*"); return; }
-        if (reconnN >= MAX_RECONN) { try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {} reconnN = 0; }
-        const m = await send(chat, "📱 *Conectando...*\n⏳ Generando QR...");
-        connMsgId = m?.message_id || null;
-        connectWA(chat).catch(e => { connecting = false; if (connMsgId) { bot.deleteMessage(chat, connMsgId).catch(() => {}); connMsgId = null; } send(chat, `❌ \`${e.message}\``, kb.main()); });
-        return;
-    }
-
+    // El botón "Conectar WhatsApp" siempre es nueva sesión
     if (d === "new_session") {
         if (val.on) { send(chat, "⚠️ Para la validación primero.", kb.running()); return; }
         destroy();
@@ -542,30 +613,36 @@ bot.on("callback_query", async q => {
     if (d === "validate") {
         if (!connected) { send(chat, "❌ Conecta WhatsApp primero.", kb.main()); return; }
         if (val.on) { send(chat, "⚠️ Validación en curso.", kb.running()); return; }
-        send(chat, "🎯 *¿Cuántos números DIGI?*", kb.amount()); return;
+        // Solo preguntar modo: leads o dedicados
+        send(chat, "🎯 *Elige el modo de validación:*\n\n👥 *Leads*: Todos los válidos\n⭐ *Dedicados*: Solo con nombre", kb.mode());
+        return;
     }
 
-    if (d.startsWith("n_") && d !== "n_custom") {
-        const n = parseInt(d.slice(2));
-        send(chat, `*${n.toLocaleString()} números DIGI* — Elige modo:\n\n👥 *Leads*: Todos los válidos\n⭐ *Dedicados*: Solo con nombre`, kb.mode(n)); return;
-    }
-
-    if (d === "n_custom") {
-        const prev = waitAmt.get(chat); if (prev) clearTimeout(prev);
-        waitAmt.set(chat, setTimeout(() => { waitAmt.delete(chat); send(chat, "⏰ Tiempo agotado.", kb.main()); }, 60000));
-        send(chat, "✏️ Escribe la cantidad (1 - 100.000):"); return;
-    }
-
-    if (d.startsWith("go_")) {
-        const parts = d.split("_"), goMode = parts[1], goN = parseInt(parts[2]);
-        if (!goN || !["leads", "dedicados"].includes(goMode)) { send(chat, "❌ Error. Reinicia.", kb.main()); return; }
-        startVal(chat, goN, goMode); return;
-    }
+    if (d === "go_leads") { startVal(chat, "leads"); return; }
+    if (d === "go_dedicados") { startVal(chat, "dedicados"); return; }
 
     if (d === "status")   { sendStatus(chat); return; }
-    if (d === "stop")     { if (!val.on) { send(chat, "ℹ️ Sin validación.", kb.main()); return; } val.stop = true; send(chat, "⛔ *Deteniendo...*"); return; }
-    if (d === "download") { sendCSV(chat); return; }
-    if (d === "download_txt") { sendTXT(chat); return; }
+
+    if (d === "stop") {
+        if (!val.on) { send(chat, "ℹ️ Sin validación.", kb.main()); return; }
+        val.stop = true;
+        send(chat, "⛔ *Deteniendo...*");
+        return;
+    }
+
+    if (d === "my_lists") { sendMyLists(chat); return; }
+
+    // Descargar lista específica
+    if (d.startsWith("dl_")) {
+        const name = d.slice(3);
+        const filePath = path.join(LISTS_DIR, `${name}.txt`);
+        if (!fs.existsSync(filePath)) { send(chat, "❌ Lista no encontrada."); return; }
+        try {
+            const count = fs.readFileSync(filePath, "utf-8").split("\n").filter(l => l.trim()).length;
+            await bot.sendDocument(chat, filePath, { caption: `📄 *${name}* — ${count.toLocaleString()} números DIGI ✅`, parse_mode: "Markdown" });
+        } catch (e) { send(chat, `❌ \`${e.message}\``); }
+        return;
+    }
 
     if (d === "disconnect") {
         if (!sock && !connecting) { send(chat, "ℹ️ Sin sesión.", kb.main()); return; }
@@ -579,36 +656,37 @@ bot.on("callback_query", async q => {
 
 // ── COMANDOS TEXTO ──
 bot.onText(/\/start/, m => send(m.chat.id,
-    `🤖 *Bot DIGI v11 — Anti-Ban*\n_Solo DIGI 🟢_\n\n` +
+    `🤖 *Bot DIGI v12 — Continuo / Anti-Ban*\n_Solo DIGI 🟢_\n\n` +
     `📱 ${connected ? "🟢 Conectado" : "🔴 Desconectado"}\n\n` +
     `Prefijos: 614, 624, 641, 642, 643\n` +
-    `🛡️ Anti-ban: lotes ${BATCH}, ${DELAY_MIN/1000}–${DELAY_MAX/1000}s delay, max ${MAX_PER_HOUR}/h`,
+    `🛡️ Anti-ban: lotes ${BATCH}, ${DELAY_MIN/1000}–${DELAY_MAX/1000}s delay, max ${MAX_PER_HOUR}/h\n` +
+    `🔄 Modo continuo: corre hasta que pulses DETENER`,
     kb.main()
 ));
 
 bot.onText(/\/conectar/, async m => {
     const c = m.chat.id;
-    if (connected) { send(c, `✅ Ya conectado (+${sock?.user?.id?.split(":")[0] || "?"})`, kb.main()); return; }
-    if (connecting) { send(c, "⏳ Conectando..."); return; }
-    if (reconnN >= MAX_RECONN) { try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {} reconnN = 0; }
+    // Siempre nueva sesión
+    if (val.on) { send(c, "⚠️ Para la validación primero.", kb.running()); return; }
+    destroy();
+    try { fs.rmSync(AUTH, { recursive: true, force: true }); } catch (_) {}
+    reconnN = 0;
+    send(c, "🗑️ *Sesión anterior eliminada.*\n📱 Generando QR nuevo...");
     const msg = await send(c, "📱 Conectando...");
     connMsgId = msg?.message_id || null;
     connectWA(c).catch(e => { connecting = false; send(c, `❌ \`${e.message}\``, kb.main()); });
 });
 
-bot.onText(/\/validar(?:\s+(\d+))?/, (m, match) => {
+bot.onText(/\/validar/, (m) => {
     const c = m.chat.id;
     if (!connected) { send(c, "❌ Conecta primero.", kb.main()); return; }
     if (val.on) { send(c, "⚠️ En curso.", kb.running()); return; }
-    const n = match?.[1] ? Math.max(1, Math.min(100000, parseInt(match[1]))) : null;
-    if (n) send(c, `*${n.toLocaleString()} DIGI* — Modo:`, kb.mode(n));
-    else send(c, "🎯 *¿Cuántos?*", kb.amount());
+    send(c, "🎯 *Elige modo:*\n\n👥 *Leads*: Todos\n⭐ *Dedicados*: Solo con nombre", kb.mode());
 });
 
 bot.onText(/\/estado/,      m => sendStatus(m.chat.id));
 bot.onText(/\/parar/,       m => { if (!val.on) { send(m.chat.id, "ℹ️ Nada activo.", kb.main()); return; } val.stop = true; send(m.chat.id, "⛔ Deteniendo..."); });
-bot.onText(/\/descargar/,   m => sendCSV(m.chat.id));
-bot.onText(/\/descargar_txt/, m => sendTXT(m.chat.id));
+bot.onText(/\/listas/,      m => sendMyLists(m.chat.id));
 bot.onText(/\/desconectar/, async m => {
     const c = m.chat.id;
     if (!sock && !connecting) { send(c, "ℹ️ Sin sesión.", kb.main()); return; }
@@ -618,15 +696,18 @@ bot.onText(/\/desconectar/, async m => {
     send(c, "🔴 *Sesión cerrada.*", kb.main());
 });
 
-// ── CANTIDAD PERSONALIZADA ──
+// ── MENSAJE DE TEXTO: Nombre de lista o comandos ──
 bot.on("message", m => {
     const c = m.chat.id;
-    if (!waitAmt.has(c) || m.text?.startsWith("/")) return;
-    const n = parseInt(m.text);
-    if (isNaN(n) || n < 1) { send(c, "❌ Número no válido."); return; }
-    const amt = Math.min(100000, n);
-    clearTimeout(waitAmt.get(c)); waitAmt.delete(c);
-    send(c, `*${amt.toLocaleString()} DIGI* — Modo:`, kb.mode(amt));
+    if (m.text?.startsWith("/")) return;
+
+    // Si estamos esperando nombre de lista
+    if (waitName.has(c)) {
+        const nombre = (m.text || "").trim();
+        if (!nombre) { send(c, "❌ Escribe un nombre válido:"); return; }
+        finalizarLista(c, nombre);
+        return;
+    }
 });
 
 // ── SHUTDOWN ──
@@ -644,9 +725,10 @@ process.on("unhandledRejection", r  => console.error("[FATAL]", r));
 
 // ── MAIN ──
 async function main() {
-    console.log("═══ Bot DIGI v11 — Anti-Ban / 10K+ ═══");
+    console.log("═══ Bot DIGI v12 — Continuo / Anti-Ban / 1800/h ═══");
     console.log(`Prefijos: ${PREFIJOS.map(p => p.slice(2)).join(", ")}`);
     console.log(`Anti-ban: batch=${BATCH}, delay=${DELAY_MIN/1000}-${DELAY_MAX/1000}s, rest cada ${REST_EVERY} lotes, max ${MAX_PER_HOUR}/h`);
+    console.log(`Modo: CONTINUO — corre hasta DETENER`);
     const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
     if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
     else console.log("Sin sesión. Esperando /conectar...");
