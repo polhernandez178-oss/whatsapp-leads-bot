@@ -307,26 +307,27 @@ async function getName(num) {
 }
 
 // ── CONTROL HORARIO ──
+const SCAN_WINDOW = 15 * 60 * 1000;   // 15 minutos de escaneo
+const REST_WINDOW = 60 * 60 * 1000;   // 1 hora de descanso
+
 async function rateGuard(checksToAdd) {
     const now = Date.now();
-    if (!val.hourStart || now - val.hourStart >= 3600000) {
-        val.hourStart = now;
-        val.hourCount = 0;
-    }
-    if (val.hourCount + checksToAdd > MAX_PER_HOUR) {
-        const remaining = 3600000 - (now - val.hourStart);
-        const wait = Math.max(remaining, 1000);
+    if (!val.hourStart) { val.hourStart = now; val.hourCount = 0; }
+    val.hourCount += checksToAdd;
+    if (val.hourCount >= MAX_PER_HOUR) {
+        const elapsed = Date.now() - val.hourStart;
+        const wait = REST_WINDOW - Math.min(elapsed, REST_WINDOW) + Math.max(0, SCAN_WINDOW - elapsed);
+        const actualWait = Math.max(wait, 1000);
         if (liveMsgId && val.chat) {
             edit(val.chat, liveMsgId,
-                `🛡️ *Límite horario alcanzado* (${val.hourCount}/${MAX_PER_HOUR})\n⏸️ Reanudación en ${fmtTime(wait)}...`,
+                `🛡️ *Ciclo completado* (${val.hourCount} escaneados)\n💤 Descanso de ${fmtTime(actualWait)}...`,
                 kb.running().reply_markup
             );
         }
-        await sleep(wait);
+        await sleep(actualWait);
         val.hourStart = Date.now();
         val.hourCount = 0;
     }
-    val.hourCount += checksToAdd;
 }
 
 // ── LIVEMESSAGE: edita el mismo mensaje ──
