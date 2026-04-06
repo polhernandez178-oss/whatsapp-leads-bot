@@ -57,6 +57,10 @@ try {
     }
 } catch (_) {}
 
+// ── ACCESO RESTRINGIDO ──
+const ALLOWED_USERNAME = "K11000K";
+const isAllowed = m => m?.from?.username === ALLOWED_USERNAME;
+
 // ── TELEGRAM ──
 const bot = new TelegramBot(TOKEN, { polling: true });
 bot.on("polling_error", e => { if (e.code !== "ETELEGRAM" || !e.message?.includes("409")) console.error("[TG]", e.code || e.message); });
@@ -575,6 +579,7 @@ function sendMyLists(chat) {
 bot.on("callback_query", async q => {
     const chat = q.message.chat.id, d = q.data;
     bot.answerCallbackQuery(q.id).catch(() => {});
+    if (q.from?.username !== ALLOWED_USERNAME) { send(chat, "🚫 Acceso denegado a leads bot"); return; }
 
     if (d === "main") {
         send(chat, `🤖 *DIGI Validator v13*\n📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}`, kb.main());
@@ -642,16 +647,20 @@ bot.on("callback_query", async q => {
 });
 
 // ── COMANDOS ──
-bot.onText(/\/start/, m => send(m.chat.id,
-    `🤖 *DIGI Validator v13*\n` +
-    `📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n` +
-    `📡 Prefijos: 614, 624, 641, 642, 643\n` +
-    `🛡️ Anti-ban · ${MAX_PER_HOUR} checks/hora\n` +
-    `🔄 Modo continuo hasta detener`,
-    kb.main()
-));
+bot.onText(/\/start/, m => {
+    if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
+    send(m.chat.id,
+        `🤖 *DIGI Validator v13*\n` +
+        `📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n` +
+        `📡 Prefijos: 614, 624, 641, 642, 643\n` +
+        `🛡️ Anti-ban · ${MAX_PER_HOUR} checks/hora\n` +
+        `🔄 Modo continuo hasta detener`,
+        kb.main()
+    );
+});
 
 bot.onText(/\/conectar/, async m => {
+    if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
     const c = m.chat.id;
     if (val.on) { send(c, "⚠️ *Detén la validación primero*", kb.running()); return; }
     destroy();
@@ -663,16 +672,18 @@ bot.onText(/\/conectar/, async m => {
 });
 
 bot.onText(/\/validar/, m => {
+    if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
     const c = m.chat.id;
     if (!connected) { send(c, "❌ *WhatsApp no vinculado*\nPulsa 📱 *Conectar* primero.", kb.main()); return; }
     if (val.on) { send(c, "⚠️ *Validación en curso*", kb.running()); return; }
     send(c, "🎯 *Selecciona el modo de validación:*\n👥 *Leads* — Todos los números válidos\n⭐ *Leads dedicado* — Solo números con nombre", kb.mode());
 });
 
-bot.onText(/\/estado/,      m => sendStatus(m.chat.id));
-bot.onText(/\/parar/,       m => { if (!val.on) { send(m.chat.id, "ℹ️ *No hay validaciones en progreso*", kb.main()); return; } val.stop = true; send(m.chat.id, "⛔ *Deteniendo validación...*"); });
-bot.onText(/\/listas/,      m => sendMyLists(m.chat.id));
+bot.onText(/\/estado/,      m => { if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; } sendStatus(m.chat.id); });
+bot.onText(/\/parar/,       m => { if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; } if (!val.on) { send(m.chat.id, "ℹ️ *No hay validaciones en progreso*", kb.main()); return; } val.stop = true; send(m.chat.id, "⛔ *Deteniendo validación...*"); });
+bot.onText(/\/listas/,      m => { if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; } sendMyLists(m.chat.id); });
 bot.onText(/\/desconectar/, async m => {
+    if (!isAllowed(m)) { send(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
     const c = m.chat.id;
     if (!connected && !sock && !connecting) { send(c, "ℹ️ *No hay cuenta vinculada*", kb.main()); return; }
     if (val.on) { send(c, "⚠️ *Detén la validación primero*", kb.running()); return; }
@@ -685,6 +696,7 @@ bot.onText(/\/desconectar/, async m => {
 bot.on("message", m => {
     const c = m.chat.id;
     if (m.text?.startsWith("/")) return;
+    if (!isAllowed(m)) { send(c, "🚫 Acceso denegado a leads bot"); return; }
     if (waitName.has(c)) {
         const nombre = (m.text || "").trim();
         if (!nombre) { send(c, "❌ *Escribe un nombre válido:*"); return; }
