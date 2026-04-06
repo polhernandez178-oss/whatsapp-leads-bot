@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bot Validador DIGI v13 — Anti-Ban / Continuo / 1800/h / LiveMessage
+// Bot Validador DIGI v13 — Anti-Ban / Continuo / 1600/h / LiveMessage
 "use strict";
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
@@ -24,7 +24,7 @@ const MAX_RECONN   = 5;
 const REST_EVERY   = 100;
 const REST_MS_MIN  = 90000;
 const REST_MS_MAX  = 210000;
-const MAX_PER_HOUR = 1800;
+const MAX_PER_HOUR = 1600;
 const ERR_PAUSE_MS = 45000;
 
 // ── PREFIJOS DIGI ──
@@ -708,7 +708,7 @@ process.on("unhandledRejection", r  => console.error("[FATAL]", r));
 
 // ── MAIN ──
 async function main() {
-    console.log("═══ DIGI Validator v13 — Continuo / Anti-Ban / 1800/h ═══");
+    console.log("═══ DIGI Validator v13 — Continuo / Anti-Ban / 1600/h ═══");
     const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
     if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
     else console.log("Sin sesión. Esperando /conectar...");
