@@ -74,12 +74,11 @@ const pct = (a, b) => b > 0 ? ((a / b) * 100).toFixed(1) : "0.0";
 // ── TECLADOS DINÁMICOS ──
 const kb = {
     main: () => {
-        const rows = [
-            [{ text: "📱 Conectar WhatsApp", callback_data: "new_session" }],
-            [{ text: "🚀 Iniciar validación", callback_data: "validate" }],
-            [{ text: "📊 Estado", callback_data: "status" }],
-            [{ text: "📂 Mis listas", callback_data: "my_lists" }],
-        ];
+        const rows = [];
+        if (!connected) rows.push([{ text: "📱 Conectar WhatsApp", callback_data: "new_session" }]);
+        rows.push([{ text: "🚀 Iniciar validación", callback_data: "validate" }]);
+        rows.push([{ text: "📊 Estado", callback_data: "status" }]);
+        rows.push([{ text: "📂 Mis listas", callback_data: "my_lists" }]);
         if (connected) rows.push([{ text: "🔌 Desconectar", callback_data: "disconnect" }]);
         return { reply_markup: { inline_keyboard: rows } };
     },
@@ -397,8 +396,6 @@ async function runValidation() {
                 );
                 await sleep(restMs);
                 if (val.stop) break;
-                val.hourStart = Date.now();
-                val.hourCount = 0;
                 if (!connected) continue;
             }
 
@@ -550,7 +547,7 @@ function sendStatus(chat) {
         (val.err ? `❌ Errores: ${val.err.toLocaleString()}\n` : "") +
         `📈 Acierto: ${rate}%\n` +
         `⚡ Velocidad: ${spd}/s\n` +
-        `🛡️ Hora: ${val.hourCount}/${MAX_PER_HOUR}\n` +
+        `🛡️ Esc/hora: ${val.hourCount}/${MAX_PER_HOUR}\n` +
         `⏱️ Tiempo: ${fmtTime(el)}`,
         kb.running()
     );
