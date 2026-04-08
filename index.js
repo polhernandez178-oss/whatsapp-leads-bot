@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Bot Validador DIGI v13 — Anti-Ban / Continuo / 1600/h / LiveMessage
+// Bot Validador DIGI v14 — Anti-Ban / 1500 scan + 1h rest / KeepAlive / LiveMessage
 "use strict";
 
 const { default: makeWASocket, useMultiFileAuthState, DisconnectReason, makeCacheableSignalKeyStore, fetchLatestBaileysVersion } = require("@whiskeysockets/baileys");
@@ -24,8 +24,12 @@ const MAX_RECONN   = 5;
 const REST_EVERY   = 100;
 const REST_MS_MIN  = 90000;
 const REST_MS_MAX  = 210000;
-const MAX_PER_HOUR = 1600;
 const ERR_PAUSE_MS = 45000;
+
+// ── CICLO: 1500 escaneados → 1h descanso ──
+const MAX_PER_CYCLE = 1500;
+const CYCLE_REST_MS = 60 * 60 * 1000; // 1 hora exacta
+const KEEPALIVE_DURING_REST_MS = 25000; // ping cada 25s durante descanso
 
 // ── PREFIJOS DIGI ──
 const PREFIJOS = ["34614", "34624", "34641", "34642", "34643"];
@@ -41,7 +45,6 @@ let qrTimer = null, qrMsgId = null, qrStart = null;
 let qrN = 0, reconnN = 0, reconnTimer = null, connChat = null;
 
 // ── LIVE MESSAGE GLOBAL ──
-// Un único mensaje que se edita siempre. Se renueva si Telegram no puede editarlo.
 let liveMsgId = null;
 let liveMsgChat = null;
 
@@ -49,7 +52,7 @@ const val = {
     on: false, stop: false,
     scanned: 0, valid: 0, skip: 0, err: 0, errRow: 0,
     start: null, chat: null, lastN: 0, lastErr: "", mode: "leads",
-    batchCount: 0, hourStart: null, hourCount: 0,
+    batchCount: 0, cycleScanned: 0, cycleNum: 1,
     currentFile: null
 };
 const checked  = new Set();
@@ -90,13 +93,11 @@ async function live(chat, txt, ex = {}) {
         }).catch(() => null);
         if (ok) return ok;
     }
-    // No hay mensaje vivo o no se pudo editar → enviamos uno nuevo
     const m = await bot.sendMessage(chat, txt, { parse_mode: "Markdown", ...ex }).catch(() => null);
     if (m) { liveMsgId = m.message_id; liveMsgChat = chat; }
     return m;
 }
 
-// Alias sin markup (para llamadas simples)
 const send = (id, txt, ex = {}) => live(id, txt, ex);
 
 // ── EDIT CAPTION (para foto QR) ──
@@ -337,27 +338,42 @@ async function getName(num) {
     return null;
 }
 
-// ── CONTROL HORARIO ──
-const SCAN_WINDOW = 15 * 60 * 1000;
-const REST_WINDOW = 60 * 60 * 1000;
+// ── KEEPALIVE DURANTE DESCANSO ──
+// Mantiene la conexión WA viva enviando presencia periódicamente
+async function keepAliveDuringRest(durationMs) {
+    const end = Date.now() + durationMs;
+    const startRest = Date.now();
 
-async function rateGuard(checksToAdd) {
-    const now = Date.now();
-    if (!val.hourStart) { val.hourStart = now; val.hourCount = 0; }
-    val.hourCount += checksToAdd;
-    if (val.hourCount >= MAX_PER_HOUR) {
-        const elapsed = Date.now() - val.hourStart;
-        const wait = REST_WINDOW - Math.min(elapsed, REST_WINDOW) + Math.max(0, SCAN_WINDOW - elapsed);
-        const actualWait = Math.max(wait, 1000);
-        if (val.chat) {
-            live(val.chat,
-                `🛡️ *Ciclo completado* (${val.hourCount} escaneados)\n💤 Descanso de ${fmtTime(actualWait)}...`,
-                kb.running()
-            );
+    while (Date.now() < end && !val.stop) {
+        // Enviar presencia para mantener la conexión viva
+        if (sock && connected) {
+            try {
+                await sock.sendPresenceUpdate("available");
+            } catch (_) {
+                // Si falla, no pasa nada, el keepAliveIntervalMs interno también ayuda
+            }
         }
-        await sleep(actualWait);
-        val.hourStart = Date.now();
-        val.hourCount = 0;
+
+        // Actualizar mensaje de Telegram cada 60s con cuenta atrás
+        const remaining = end - Date.now();
+        if (remaining > 0 && val.chat) {
+            const modeLabel = val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads";
+            await live(val.chat,
+                `😴 *Descanso — Ciclo ${val.cycleNum} completado*\n` +
+                `${modeLabel} · DIGI 🟢\n\n` +
+                `✅ Válidos total: ${val.valid.toLocaleString()}\n` +
+                `🔍 Escaneados total: ${val.scanned.toLocaleString()}\n` +
+                `📊 Este ciclo: ${val.cycleScanned.toLocaleString()}/${MAX_PER_CYCLE}\n\n` +
+                `⏳ Reanudación en: *${fmtTime(remaining)}*\n` +
+                `📶 Conexión WA: ${connected ? "🟢 Activa" : "🔴 Caída"}\n` +
+                `🛡️ KeepAlive activo`,
+                kb.running()
+            ).catch(() => {});
+        }
+
+        // Esperar 30s entre pings (o menos si queda poco)
+        const waitMs = Math.min(KEEPALIVE_DURING_REST_MS, end - Date.now());
+        if (waitMs > 0) await sleep(waitMs);
     }
 }
 
@@ -367,13 +383,13 @@ async function updateLive(txt, markup) {
     await live(val.chat, txt, { reply_markup: markup });
 }
 
-// ── VALIDACIÓN CONTINUA ──
+// ── VALIDACIÓN CONTINUA CON CICLOS 1500 + 1h REST ──
 async function runValidation() {
     val.start = Date.now();
     val.scanned = 0; val.valid = 0; val.skip = 0;
     val.err = 0; val.errRow = 0; val.lastN = 0; val.lastErr = "";
     val.stop = false; val.batchCount = 0;
-    val.hourStart = Date.now(); val.hourCount = 0;
+    val.cycleScanned = 0; val.cycleNum = 1;
     val.currentFile = path.join(LISTS_DIR, `_temp_session_${Date.now()}.txt`);
 
     loadChecked();
@@ -381,12 +397,54 @@ async function runValidation() {
 
     const modeLabel = val.mode === "dedicados" ? "⭐ Leads dedicado" : "👥 Leads";
     await updateLive(
-        `🚀 *Validación iniciada*\n${modeLabel} · DIGI 🟢\n🔄 Escaneando números...`,
+        `🚀 *Validación iniciada — Ciclo ${val.cycleNum}*\n${modeLabel} · DIGI 🟢\n🔄 Escaneando ${MAX_PER_CYCLE} números por ciclo...`,
         kb.running().reply_markup
     );
 
     try {
         while (!val.stop) {
+            // ── CONTROL DE CICLO: 1500 escaneados → descanso 1h ──
+            if (val.cycleScanned >= MAX_PER_CYCLE) {
+                // Enviar presencia "unavailable" antes de descansar
+                if (sock && connected) {
+                    try { await sock.sendPresenceUpdate("unavailable"); } catch (_) {}
+                }
+
+                await updateLive(
+                    `🛡️ *Ciclo ${val.cycleNum} completado* (${val.cycleScanned} escaneados)\n` +
+                    `😴 Descanso de *1 hora* para proteger la cuenta...\n` +
+                    `📶 Conexión WA: ${connected ? "🟢 Activa" : "🔴 Caída"}\n` +
+                    `⏳ Reanudación en: *${fmtTime(CYCLE_REST_MS)}*`,
+                    kb.running().reply_markup
+                );
+
+                // Descanso con keepalive
+                await keepAliveDuringRest(CYCLE_REST_MS);
+
+                if (val.stop) break;
+
+                // Nuevo ciclo
+                val.cycleNum++;
+                val.cycleScanned = 0;
+                val.batchCount = 0;
+                val.errRow = 0;
+
+                // Reactivar presencia
+                if (sock && connected) {
+                    try { await sock.sendPresenceUpdate("available"); } catch (_) {}
+                }
+
+                await updateLive(
+                    `🚀 *Ciclo ${val.cycleNum} iniciado*\n${modeLabel} · DIGI 🟢\n` +
+                    `✅ Válidos acumulados: ${val.valid.toLocaleString()}\n` +
+                    `🔍 Escaneados acumulados: ${val.scanned.toLocaleString()}\n` +
+                    `🔄 Escaneando ${MAX_PER_CYCLE} números más...`,
+                    kb.running().reply_markup
+                );
+
+                continue;
+            }
+
             if (!connected) {
                 dcWait++;
                 if (dcWait > 3) {
@@ -421,12 +479,15 @@ async function runValidation() {
                 if (!connected) continue;
             }
 
-            await rateGuard(BATCH);
             if (val.stop) break;
+
+            // Calcular cuántos números faltan en este ciclo
+            const remaining = MAX_PER_CYCLE - val.cycleScanned;
+            const thisBatch = Math.min(BATCH, remaining);
 
             const batch = [];
             let att = 0;
-            while (batch.length < BATCH && att < BATCH * 30) {
+            while (batch.length < thisBatch && att < thisBatch * 30) {
                 att++;
                 const n = genNum();
                 if (!checked.has(n)) { batch.push(n); checked.add(n); }
@@ -436,10 +497,11 @@ async function runValidation() {
             const res = await checkNums(batch);
             val.batchCount++;
 
+            let scannedThisBatch = 0;
             for (let i = 0; i < batch.length; i++) {
                 if (val.stop) break;
                 if (res[i] === null) { val.err++; val.errRow++; continue; }
-                val.scanned++; val.errRow = 0;
+                val.scanned++; val.cycleScanned++; scannedThisBatch++; val.errRow = 0;
                 if (res[i]) {
                     let name = null;
                     try { name = await timeout(getName(batch[i]), 8000, null); } catch (_) {}
@@ -454,13 +516,13 @@ async function runValidation() {
             const el2 = Date.now() - val.start;
             const spd2 = el2 > 0 ? (val.scanned / (el2 / 1000)).toFixed(2) : "0";
             await updateLive(
-                `🔄 *Validando...*\n${modeLabel} · DIGI 🟢\n` +
+                `🔄 *Validando — Ciclo ${val.cycleNum}*\n${modeLabel} · DIGI 🟢\n` +
                 `✅ Válidos: ${val.valid.toLocaleString()}\n` +
                 `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
                 (val.skip ? `⏭️ Sin nombre: ${val.skip.toLocaleString()}\n` : "") +
                 `📈 Acierto: ${pct(val.valid, val.scanned)}%\n` +
                 `⚡ Velocidad: ${spd2}/s\n` +
-                `🛡️ Esc/hora: ${val.hourCount}/${MAX_PER_HOUR}\n` +
+                `🛡️ Ciclo: ${val.cycleScanned}/${MAX_PER_CYCLE}\n` +
                 `⏱️ Tiempo: ${fmtTime(el2)}`,
                 kb.running().reply_markup
             );
@@ -483,6 +545,7 @@ async function runValidation() {
             `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
             (val.skip ? `⏭️ Sin nombre: ${val.skip.toLocaleString()}\n` : "") +
             `📈 Acierto: ${rate}%\n` +
+            `🔄 Ciclos completados: ${val.cycleNum}\n` +
             `⏱️ Duración: ${fmtTime(el)}\n` +
             `📝 *Escribe el nombre para guardar la lista:*`
         );
@@ -496,6 +559,7 @@ async function runValidation() {
             `⛔ *Validación finalizada*\n` +
             `✅ Válidos: ${val.valid.toLocaleString()}\n` +
             `🔍 Escaneados: ${val.scanned.toLocaleString()}\n` +
+            `🔄 Ciclos: ${val.cycleNum}\n` +
             `⏱️ Duración: ${fmtTime(el)}\n` +
             `_No se encontraron números válidos._`,
             kb.done()
@@ -518,7 +582,7 @@ function finalizarLista(chat, nombre) {
     const safe = nombre.replace(/[^a-zA-Z0-9áéíóúñÁÉÍÓÚÑ _-]/g, "").trim();
     if (!safe) { live(chat, "❌ *Nombre no válido.* Escribe otro:"); return; }
     if (usedNames.has(safe.toLowerCase())) {
-        live(chat, `❌ Ya existe *\"${safe}\"*. Escribe otro nombre:`);
+        live(chat, `❌ Ya existe *"${safe}"*. Escribe otro nombre:`);
         return;
     }
     const finalPath = path.join(LISTS_DIR, `${safe}.txt`);
@@ -557,7 +621,7 @@ function startVal(chat, mode) {
     runValidation().catch(e => { val.on = false; live(chat, `💥 \`${e.message}\``, kb.done()); });
 }
 
-// ── ESTADO (solo bajo demanda) ──
+// ── ESTADO ──
 function sendStatus(chat) {
     if (!val.on) { live(chat, "ℹ️ *No hay validaciones en progreso*", kb.main()); return; }
     const el  = val.start ? Date.now() - val.start : 0;
@@ -573,7 +637,7 @@ function sendStatus(chat) {
         (val.err ? `❌ Errores: ${val.err.toLocaleString()}\n` : "") +
         `📈 Acierto: ${rate}%\n` +
         `⚡ Velocidad: ${spd}/s\n` +
-        `🛡️ Esc/hora: ${val.hourCount}/${MAX_PER_HOUR}\n` +
+        `🛡️ Ciclo ${val.cycleNum}: ${val.cycleScanned}/${MAX_PER_CYCLE}\n` +
         `⏱️ Tiempo: ${fmtTime(el)}`,
         kb.running()
     );
@@ -603,7 +667,7 @@ bot.on("callback_query", async q => {
     if (q.from?.username !== ALLOWED_USERNAME) { live(chat, "🚫 Acceso denegado a leads bot"); return; }
 
     if (d === "main") {
-        live(chat, `🤖 *DIGI Validator v13*\n📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}`, kb.main());
+        live(chat, `🤖 *DIGI Validator v14*\n📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n🛡️ ${MAX_PER_CYCLE} escaneos/ciclo + 1h descanso`, kb.main());
         return;
     }
 
@@ -670,10 +734,10 @@ bot.on("callback_query", async q => {
 bot.onText(/\/start/, m => {
     if (!isAllowed(m)) { live(m.chat.id, "🚫 Acceso denegado a leads bot"); return; }
     live(m.chat.id,
-        `🤖 *DIGI Validator v13*\n` +
+        `🤖 *DIGI Validator v14*\n` +
         `📱 ${connected ? "🟢 Cuenta vinculada" : "🔴 Sin cuenta"}\n` +
         `📡 Prefijos: 614, 624, 641, 642, 643\n` +
-        `🛡️ Anti-ban · ${MAX_PER_HOUR} checks/hora\n` +
+        `🛡️ Anti-ban · ${MAX_PER_CYCLE} escaneos/ciclo + 1h descanso\n` +
         `🔄 Modo continuo hasta detener`,
         kb.main()
     );
@@ -739,7 +803,7 @@ process.on("unhandledRejection", r  => console.error("[FATAL]", r));
 
 // ── MAIN ──
 async function main() {
-    console.log("═══ DIGI Validator v13 — Continuo / Anti-Ban / 1600/h ═══");
+    console.log("═══ DIGI Validator v14 — 1500/ciclo + 1h descanso + KeepAlive ═══");
     const has = fs.existsSync(AUTH) && (() => { try { return fs.readdirSync(AUTH).length > 0; } catch (_) { return false; } })();
     if (has) { console.log("Reconectando..."); connectWA(null).catch(() => { connecting = false; }); }
     else console.log("Sin sesión. Esperando /conectar...");
